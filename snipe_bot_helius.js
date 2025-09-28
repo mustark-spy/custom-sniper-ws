@@ -258,7 +258,17 @@ function txTouchesKnownAMMPrograms(payload){
     }
   };
 
-  for (const ins of msgIns) addSeen(ins);
+  for (const ins of msgIns) {
+    addSeen(ins);
+    console.log("DEBUG ins =>", JSON.stringify(ins, null, 2));
+  }
+  for (const innerIx of inner) {
+    for (const ix of innerIx.instructions || []) {
+      addSeen(ix);
+      console.log("DEBUG inner ins =>", JSON.stringify(ix, null, 2));
+    }
+  }
+  console.log("DEBUG seen programs =>", Array.from(seen));
   for (const grp of inner) for (const ins of (grp.instructions||[])) addSeen(ins);
 
   for (const k of seen) if (programs.has(k)) return true;
