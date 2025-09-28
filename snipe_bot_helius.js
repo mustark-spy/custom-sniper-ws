@@ -28,6 +28,7 @@
  *  AMM_PROGRAM_IDS=<comma separated program ids> (optionnel)
  *  HELIUS_SECRET=   (HMAC)  OU  HELIUS_PUBLIC_KEY= (Ed25519 base58)
  *  EXECUTOR_URL=https://executor-xxx.onrender.com (obligatoire en MODE=live)
+ *  LOG_LEVEL=info | debug   (optionnel ; limite le spam)
  */
 
 import 'dotenv/config';
@@ -71,6 +72,7 @@ const CFG = {
   HELIUS_SECRET: process.env.HELIUS_SECRET || '',
   HELIUS_PUBLIC_KEY: process.env.HELIUS_PUBLIC_KEY || '',
   EXECUTOR_URL: process.env.EXECUTOR_URL || '', // requis en MODE=live
+  LOG_LEVEL: (process.env.LOG_LEVEL || 'info').toLowerCase(),
 };
 
 const connection = new Connection(CFG.RPC_URL, { commitment: 'confirmed' });
@@ -85,6 +87,7 @@ function csvLog(row){
 // -------------------- Helpers --------------------
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 function ts(){ return new Date().toISOString(); }
+const dbg = (...args)=>{ if (CFG.LOG_LEVEL === 'debug') console.log(...args); };
 
 // -------------------- Verify Helius signature --------------------
 function verifyHelius(req, rawBody){
@@ -243,37 +246,51 @@ async function onChainChecks(mintAddress){
   }
 }
 
-function txTouchesKnownAMMPrograms(payload){
-  console.log("DEBUG payload =>", JSON.stringify(payload, null, 2));
-  if (!CFG.AMM_PROGRAM_IDS.length) return true; // pas de filtre si liste vide
+/**
+ * Détermine si la tx touche un AMM connu.
+ * - 1) Lecture des instructions: programId / programIdIndex -> accountKeys
+ * - 2) Fallback Helius "enhanced": si payload.type ∈ {ADD_LIQUIDITY, SWAP, REMOVE_LIQUIDITY, LIQUIDITY_ADD, LIQUIDITY_REMOVE} => accepte
+ * - 3) (Optionnel) Fallback events: payload.events.swap / payload.events.amm
+ */
+function txTouchesKnownAMMPrograms(payload) {
+  if (!CFG.AMM_PROGRAM_IDS.length) return true;
+
   const programs = new Set(CFG.AMM_PROGRAM_IDS);
   const msgIns = payload?.transaction?.message?.instructions || [];
   const inner = payload?.meta?.innerInstructions || [];
   const seen = new Set();
 
   const addSeen = (ins) => {
+    if (!ins) return;
     if (ins.programId) seen.add(String(ins.programId));
     const keys = payload?.transaction?.message?.accountKeys || [];
     if (ins.programIdIndex !== undefined && keys[ins.programIdIndex]) {
       seen.add(String(keys[ins.programIdIndex]));
     }
+    // certains payloads utilisent "program"
+    if (ins.program) seen.add(String(ins.program));
   };
 
-  for (const ins of msgIns) {
-    addSeen(ins);
-    console.log("DEBUG ins =>", JSON.stringify(ins, null, 2));
-  }
-  for (const innerIx of inner) {
-    for (const ix of innerIx.instructions || []) {
-      addSeen(ix);
-      console.log("DEBUG inner ins =>", JSON.stringify(ix, null, 2));
-    }
-  }
-  console.log("DEBUG seen programs =>", Array.from(seen));
-  for (const grp of inner) for (const ins of (grp.instructions||[])) addSeen(ins);
+  msgIns.forEach(addSeen);
+  inner.forEach(group => (group.instructions || []).forEach(addSeen));
 
-  for (const k of seen) if (programs.has(k)) return true;
-  return false;
+  // Fallback par type Helius (enhanced)
+  const type = String(payload?.type || '').toUpperCase();
+  const TYPE_ALLOW = new Set(['ADD_LIQUIDITY','LIQUIDITY_ADD','SWAP','REMOVE_LIQUIDITY','LIQUIDITY_REMOVE']);
+  if (type && TYPE_ALLOW.has(type)) {
+    dbg('Accepted by type fallback:', type);
+    return true;
+  }
+
+  // Fallback par events (selon enrichissements Helius)
+  if (payload?.events?.swap || payload?.events?.amm) {
+    dbg('Accepted by events fallback (swap/amm)');
+    return true;
+  }
+
+  const matched = [...seen].some(p => programs.has(p));
+  if (!matched) dbg('AMM filter skip → seen:', Array.from(seen));
+  return matched;
 }
 
 // -------------------- Extract mint & liquidity heuristics --------------------
@@ -296,9 +313,16 @@ function estimateSOLAdded(tx){
   let lamports = 0;
   const top = tx?.transaction?.message?.instructions || [];
   const inner = tx?.meta?.innerInstructions || [];
-  const scan = (ins)=>{ if (ins.parsed?.type==='transfer' && ins.parsed?.info?.lamports){ lamports += Number(ins.parsed.info.lamports); } };
+  const scan = (ins)=>{ if (ins?.parsed?.type==='transfer' && ins?.parsed?.info?.lamports){ lamports += Number(ins.parsed.info.lamports); } };
   top.forEach(scan);
   inner.forEach(g => (g.instructions||[]).forEach(scan));
+
+  // Fallback: certains enhanced payloads fournissent nativeTransfers[]
+  const nativeTransfers = tx?.nativeTransfers || tx?.events?.nativeTransfers || [];
+  for (const nt of (nativeTransfers || [])) {
+    if (nt?.amount) lamports += Number(nt.amount);
+  }
+
   return lamports / LAMPORTS_PER_SOL;
 }
 
@@ -381,18 +405,22 @@ app.post('/helius-webhook', async (req, res) => {
 
     const payload = Array.isArray(req.body) ? req.body[0] : req.body;
 
-    // Filtre AMM (si défini)
+    // Filtre AMM (avec fallbacks)
     if (!txTouchesKnownAMMPrograms(payload)) {
-      console.log('AMM filter: no known AMM program → skip');
-      console.log("DEBUG payload =>", JSON.stringify(payload, null, 2));
+      // silence par défaut ; passe en debug pour voir
+      dbg('AMM filter: skip (no known AMM program / type)');
       return res.status(200).send({ ok:true, note:'amm-filter-skip' });
     }
 
     // Détection mint & liquidité
     const mint = extractCandidateMintViaBalances(payload);
     const solAdded = estimateSOLAdded(payload);
-    if (!mint) return res.status(200).send({ ok:true, note:'no-mint' });
+    if (!mint) {
+      dbg('No candidate mint found');
+      return res.status(200).send({ ok:true, note:'no-mint' });
+    }
     if (solAdded < CFG.MIN_LIQUIDITY_SOL) {
+      dbg('Low liquidity', solAdded);
       return res.status(200).send({ ok:true, note:'low-liquidity', solAdded });
     }
 
@@ -409,7 +437,7 @@ app.post('/helius-webhook', async (req, res) => {
       swapB64 = await buildSwapTransactionBase64(mint);
       await simulateJupiterSwapBase64(swapB64);
     } catch (e) {
-      console.log('simulate/build fail:', e.message);
+      dbg('simulate/build fail:', e.message);
       return res.status(200).send({ ok:true, note:'simulate-fail', err: e.message });
     }
 
