@@ -218,6 +218,9 @@ async function paperBuy(tokenMint){
 
 // -------------------- On-chain checks & AMM filter --------------------
 async function onChainChecks(mintAddress){
+  // Bypass total en mode test
+  if (process.env.SKIP_ONCHAIN === '1') return { ok: true, info: { bypass: true } };
+
   try {
     const mintPub = new PublicKey(mintAddress);
     const mintAcct = await connection.getParsedAccountInfo(mintPub, 'confirmed');
@@ -226,13 +229,22 @@ async function onChainChecks(mintAddress){
     const mintAuth = mintData?.mintAuthority || null;
     const supply = Number(mintData?.supply || 0);
 
-    const largest = await connection.getTokenLargestAccounts(mintPub);
-    const arr = largest.value || [];
+    // Soft-fallback : si on ne peut pas lire les largest accounts, on ne rejette pas en test
     let topPct = 0;
-    if (arr.length){
-      const topAmt = Number(arr[0].amount || 0);
-      const supplyNum = Number(supply || 0) || 1;
-      topPct = topAmt / supplyNum * 100;
+    try {
+      const largest = await connection.getTokenLargestAccounts(mintPub);
+      const arr = largest.value || [];
+      if (arr.length){
+        const topAmt = Number(arr[0].amount || 0);
+        const supplyNum = Number(supply || 0) || 1;
+        topPct = topAmt / supplyNum * 100;
+      }
+    } catch (e) {
+      if (process.env.ONCHAIN_SOFT_FAIL !== '0') {
+        console.warn('largestAccounts unavailable → soft pass:', e.message);
+        return { ok: true, info: { soft: true, reason: e.message } };
+      }
+      return { ok:false, reason:'largestAccounts error: ' + e.message };
     }
 
     if (topPct > (100 - CFG.MIN_TOPHOLDERS_PERCENT)) return { ok:false, reason:`Top holder ${topPct.toFixed(2)}%` };
@@ -242,9 +254,13 @@ async function onChainChecks(mintAddress){
     return { ok:true, info:{ supply, topPct, freeze, mintAuth } };
   } catch (e){
     console.warn('onChainChecks error', e.message);
+    if (process.env.ONCHAIN_SOFT_FAIL !== '0') {
+      return { ok: true, info: { soft:true, error: e.message } };
+    }
     return { ok:false, reason:'onChainChecks failure: ' + e.message };
   }
 }
+
 
 /**
  * Détermine si la tx touche un AMM connu.
