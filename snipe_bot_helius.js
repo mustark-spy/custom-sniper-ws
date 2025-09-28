@@ -292,7 +292,7 @@ function txTouchesKnownAMMPrograms(payload) {
 
   // Fallback par type Helius (enhanced)
   const type = String(payload?.type || '').toUpperCase();
-  const TYPE_ALLOW = new Set(['ADD_LIQUIDITY','LIQUIDITY_ADD','SWAP','REMOVE_LIQUIDITY','LIQUIDITY_REMOVE']);
+  const TYPE_ALLOW = new Set(['ADD_LIQUIDITY','CREATE_POOL']);
   if (type && TYPE_ALLOW.has(type)) {
     dbg('Accepted by type fallback:', type);
     return true;
