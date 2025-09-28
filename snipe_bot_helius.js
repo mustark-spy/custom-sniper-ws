@@ -244,6 +244,7 @@ async function onChainChecks(mintAddress){
 }
 
 function txTouchesKnownAMMPrograms(payload){
+  console.log("DEBUG payload =>", JSON.stringify(payload, null, 2));
   if (!CFG.AMM_PROGRAM_IDS.length) return true; // pas de filtre si liste vide
   const programs = new Set(CFG.AMM_PROGRAM_IDS);
   const msgIns = payload?.transaction?.message?.instructions || [];
@@ -383,6 +384,7 @@ app.post('/helius-webhook', async (req, res) => {
     // Filtre AMM (si défini)
     if (!txTouchesKnownAMMPrograms(payload)) {
       console.log('AMM filter: no known AMM program → skip');
+      console.log("DEBUG payload =>", JSON.stringify(payload, null, 2));
       return res.status(200).send({ ok:true, note:'amm-filter-skip' });
     }
 
