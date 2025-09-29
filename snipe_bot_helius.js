@@ -282,7 +282,7 @@ async function managePositionLoop() {
 
 // -------------------- Webhook --------------------
 const app = express();
-app.use(bodyParser.json({ limit:'1mb' }));
+app.use(bodyParser.json({ limit:'20mb' }));
 
 // anti re-fire: on ne traite qu’une fois par mint (cooldown court)
 const seenMint = new Map(); // mint => ts
