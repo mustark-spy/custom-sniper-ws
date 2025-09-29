@@ -456,6 +456,7 @@ app.post('/helius-webhook', async (req, res) => {
     const mint = extractCandidateMintEnhanced(payload);
     if (!mint) {
       dbg('No candidate mint found (type:', payload?.type, ')');
+      dbg(JSON.stringify(payload));
       return res.status(200).send({ ok: true, note: 'no-mint' });
     }
 
