@@ -128,7 +128,7 @@ async function pumpBuildAndSend(body) {
   });
   if (!res.ok) {
     const t = await res.text();
-    throw new Error(`pump trade-local ${res.status}: ${t} \n${JSON.stringify(res)}`);
+    throw new Error(`pump trade-local ${res.status}: ${t} \nres:\n${JSON.stringify(res)} \nbody:\n${JSON.stringify(body)}`);
   }
   // réponse = tx sérialisée (buffer)
   const buf = new Uint8Array(await res.arrayBuffer());
