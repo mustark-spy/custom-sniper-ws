@@ -1,29 +1,17 @@
 /**
- * snipe_bot_helius.js  —  Webhook Helius -> checks -> (paper) trade simulé OU (live) via executor
+ * snipe_bot_helius.js — Lite
+ * Détection & log du mint + estimation liquidité SOL (aucun trade, aucun appel Jupiter)
  *
- * ENV clés :
- *  MODE=paper | live
- *  RPC_URL=...
- *  JUPITER_QUOTE_URL=https://quote-api.jup.ag/v6/quote
- *  JUPITER_SWAP_URL=https://quote-api.jup.ag/v6/swap
- *  BASE_SOL_MINT=So11111111111111111111111111111111111111112
- *  TRADE_SIZE_SOL=0.15
- *  MAX_SLIPPAGE=0.30
- *  PRIORITY_FEE_SOL=0.008
- *  TP1_PCT=0.40
- *  TP1_SELL=0.70
- *  TRAIL_GAP=0.20
- *  HARD_SL=0.35
- *  POLL_MS=200
- *  LATENCY_MS=400
- *  AMM_FEE_RT=0.007
- *  CSV_FILE=paper_trades.csv
- *  MIN_LIQUIDITY_SOL=0.5
- *  MIN_TOPHOLDERS_PERCENT=30
- *  AMM_PROGRAM_IDS=<comma ids>
- *  HELIUS_SECRET=  (HMAC)  OU  HELIUS_PUBLIC_KEY= (Ed25519 base58)
- *  EXECUTOR_URL=https://executor-xxx.onrender.com (obligatoire en MODE=live)
- *  SKIP_ONCHAIN=1  (optionnel: saute les checks on-chain)
+ * ENV utiles:
+ *  PORT=3000
+ *  LOG_LEVEL=debug|info
+ *  AMM_PROGRAM_IDS=orcaEKTd...,RVKd61...,Amm1LV...,675kPX...,pAMMBay6...
+ *  HELIUS_PUBLIC_KEY= (optionnel, Ed25519 base58)
+ *  HELIUS_SECRET=     (optionnel, HMAC hex)
+ *
+ * Endpoints:
+ *  GET  /health
+ *  POST /helius-webhook   (payload Helius Enhanced)
  */
 
 import 'dotenv/config';
@@ -31,75 +19,47 @@ import express from 'express';
 import bodyParser from 'body-parser';
 import crypto from 'crypto';
 import nacl from 'tweetnacl';
-import fetch from 'node-fetch';
-import fs from 'fs';
 import bs58 from 'bs58';
-import {
-  Connection,
-  PublicKey,
-  LAMPORTS_PER_SOL,
-  VersionedTransaction,
-  Keypair
-} from '@solana/web3.js';
 
-// -------------------- Config --------------------
+/* ----------------- Config ------------------ */
 const PORT = Number(process.env.PORT || 3000);
+const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase();
+const log = (...a) => console.log(...a);
+const dbg = (...a) => { if (LOG_LEVEL === 'debug') console.log(...a); };
+
 const CFG = {
-  MODE: (process.env.MODE || 'paper').toLowerCase(), // 'paper' | 'live'
-  RPC_URL: process.env.RPC_URL || 'https://api.mainnet-beta.solana.com',
-  JUP_Q_URL: process.env.JUPITER_QUOTE_URL || 'https://quote-api.jup.ag/v6/quote',
-  JUP_S_URL: process.env.JUPITER_SWAP_URL || 'https://quote-api.jup.ag/v6/swap',
-  BASE_SOL_MINT: process.env.BASE_SOL_MINT || 'So11111111111111111111111111111111111111112',
-  TRADE_SIZE_SOL: Number(process.env.TRADE_SIZE_SOL || 0.15),
-  MAX_SLIPPAGE: Number(process.env.MAX_SLIPPAGE || 0.30),
-  PRIORITY_FEE_SOL: Number(process.env.PRIORITY_FEE_SOL || 0.008),
-  TP1_PCT: Number(process.env.TP1_PCT || 0.40),
-  TP1_SELL: Number(process.env.TP1_SELL || 0.70),
-  TRAIL_GAP: Number(process.env.TRAIL_GAP || 0.20),
-  HARD_SL: Number(process.env.HARD_SL || 0.35),
-  POLL_MS: Number(process.env.POLL_MS || 200),
-  LATENCY_MS: Number(process.env.LATENCY_MS || 400),
-  AMM_FEE_RT: Number(process.env.AMM_FEE_RT || 0.007),
-  CSV_FILE: process.env.CSV_FILE || 'paper_trades.csv',
-  MIN_LIQUIDITY_SOL: Number(process.env.MIN_LIQUIDITY_SOL || 0.5),
-  MIN_TOPHOLDERS_PERCENT: Number(process.env.MIN_TOPHOLDERS_PERCENT || 30),
-  AMM_PROGRAM_IDS: (process.env.AMM_PROGRAM_IDS || '').split(',').map(s=>s.trim()).filter(Boolean),
-  HELIUS_SECRET: process.env.HELIUS_SECRET || '',
+  AMM_PROGRAM_IDS: (process.env.AMM_PROGRAM_IDS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean),
   HELIUS_PUBLIC_KEY: process.env.HELIUS_PUBLIC_KEY || '',
-  EXECUTOR_URL: process.env.EXECUTOR_URL || '', // requis en MODE=live
-  SKIP_ONCHAIN: Boolean(Number(process.env.SKIP_ONCHAIN || 0))
+  HELIUS_SECRET: process.env.HELIUS_SECRET || '',
+  BASE_SOL_MINT: 'So11111111111111111111111111111111111111112',
 };
 
-const connection = new Connection(CFG.RPC_URL, { commitment: 'confirmed' });
-
-// -------------------- CSV logger --------------------
-if (!fs.existsSync(CFG.CSV_FILE)) fs.writeFileSync(CFG.CSV_FILE, 'time,event,side,price,sol,token,realized_pnl\n');
-function csvLog(row){
-  const line = `${new Date().toISOString()},${row.event},${row.side||''},${row.price||''},${row.sol||''},${row.token||''},${row.pnl||''}\n`;
-  fs.appendFileSync(CFG.CSV_FILE, line);
-}
-
-// -------------------- Helpers --------------------
-const SPL_BLACKLIST = new Set([
-  '11111111111111111111111111111111',
+/* ------------- Helpers / filters -------------- */
+const SYS_BLACKLIST = new Set([
+  '11111111111111111111111111111111', // System
   'SysvarRent111111111111111111111111111111111',
   'ComputeBudget111111111111111111111111111111',
-  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
-  'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
-  'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', // SPL Token
+  'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', // ATA
+  'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',  // Token-2022
 ]);
 
-function looksLikeMint(x){ return typeof x === 'string' && x.length >= 32 && !SPL_BLACKLIST.has(x); }
-function preferNonBase(mints){
-  const nonBase = mints.find(m => m !== CFG.BASE_SOL_MINT);
-  return nonBase || mints[0] || null;
+function looksLikeMint(x) {
+  return typeof x === 'string' && x.length >= 32 && !SYS_BLACKLIST.has(x);
 }
-function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+function preferNonSOL(arr) {
+  const nonSol = arr.find(m => m !== CFG.BASE_SOL_MINT);
+  return nonSol || arr[0] || null;
+}
 
-// -------------------- Verify Helius signature --------------------
-function verifyHelius(req, rawBody){
+/* --------- Helius signature verification -------- */
+function verifyHelius(req, rawBody) {
   const sigHeader = req.headers['x-helius-signature'] || req.headers['x-helio-signature'];
-  if (!CFG.HELIUS_PUBLIC_KEY && !CFG.HELIUS_SECRET) return true; // dev mode
+  // Dev mode: si aucune clé n’est fournie, on accepte
+  if (!CFG.HELIUS_PUBLIC_KEY && !CFG.HELIUS_SECRET) return true;
   if (!sigHeader) return false;
 
   if (CFG.HELIUS_PUBLIC_KEY) {
@@ -112,10 +72,11 @@ function verifyHelius(req, rawBody){
       return false;
     }
   }
-
   if (CFG.HELIUS_SECRET) {
     try {
-      const hmac = crypto.createHmac('sha256', CFG.HELIUS_SECRET).update(rawBody).digest('hex');
+      const hmac = crypto.createHmac('sha256', CFG.HELIUS_SECRET)
+        .update(rawBody)
+        .digest('hex');
       return hmac === String(sigHeader).toLowerCase();
     } catch (e) {
       console.warn('HMAC verify error:', e.message);
@@ -125,184 +86,54 @@ function verifyHelius(req, rawBody){
   return false;
 }
 
-// -------------------- Jupiter helpers --------------------
-async function jupQuote({ inputMint, outputMint, amount, slippageBps = 3000 }){
-  const url = new URL(CFG.JUP_Q_URL);
-  url.searchParams.set('inputMint', inputMint);
-  url.searchParams.set('outputMint', outputMint);
-  url.searchParams.set('amount', String(amount));
-  url.searchParams.set('slippageBps', String(slippageBps));
-  url.searchParams.set('onlyDirectRoutes', 'false');
-  url.searchParams.set('asLegacyTransaction', 'false');
-
-  const res = await fetch(url, { headers: { 'accept': 'application/json' } });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`Jupiter quote failed ${res.status} ${txt}`);
-  }
-  return res.json();
-}
-function priceFromQuote(q){
-  if (!q?.data?.[0]) return null;
-  const r = q.data[0];
-  const inAmt = Number(r.inAmount) / (10 ** (r.inAmountDecimals ?? 9));
-  const outAmt = Number(r.outAmount) / (10 ** (r.outAmountDecimals ?? 9));
-  return inAmt / outAmt; // SOL per TOKEN
-}
-
-// -------------------- PAPER trading core --------------------
-let position = null; // { entry, sizeToken, high, remainingPct, tokenMint }
-
-function trailStopPrice(pos){ return pos.high * (1 - CFG.TRAIL_GAP); }
-
-async function getCurrentPrice(tokenMint){
-  const lamports = Math.floor(0.05 * LAMPORTS_PER_SOL);
-  try {
-    const q = await jupQuote({ inputMint: CFG.BASE_SOL_MINT, outputMint: tokenMint, amount: lamports, slippageBps: Math.floor(CFG.MAX_SLIPPAGE * 10000) });
-    return priceFromQuote(q) || position?.entry || 0.000001;
-  } catch {
-    return position?.entry || 0.000001;
-  }
-}
-
-async function paperSell(pct){
-  if (!position) return;
-  const sizeSell = position.sizeToken * pct;
-  const estInLamports = Math.max(1, Math.floor((position.entry * sizeSell) * LAMPORTS_PER_SOL));
-  let q=null; try {
-    q = await jupQuote({ inputMint: position.tokenMint, outputMint: CFG.BASE_SOL_MINT, amount: estInLamports, slippageBps: Math.floor(CFG.MAX_SLIPPAGE*10000) });
-  } catch {}
-  const px = priceFromQuote(q) || position.entry;
-  const pxFill = px * (1 - CFG.MAX_SLIPPAGE * 0.5);
-  const proceedsSOL = sizeSell * pxFill * (1 - CFG.AMM_FEE_RT) - CFG.PRIORITY_FEE_SOL;
-  const costBasisSOL = sizeSell * position.entry;
-  const pnl = proceedsSOL - costBasisSOL;
-  position.sizeToken -= sizeSell;
-  csvLog({ event:'paper_sell', side:'SELL', price:pxFill, sol:proceedsSOL, token:sizeSell, pnl });
-  console.log(`[PAPER SELL] price=${pxFill} sold=${sizeSell} proceedsSOL≈${proceedsSOL} pnl≈${pnl}`);
-  if (position.sizeToken <= 1e-12) position = null;
-}
-
-async function managePositionLoop(){
-  if (!position) return;
-  const p = await getCurrentPrice(position.tokenMint);
-  if (!p) return setTimeout(managePositionLoop, CFG.POLL_MS);
-  if (p > position.high) position.high = p;
-  const up = p / position.entry - 1;
-  const down = 1 - p / position.entry;
-
-  if (position.remainingPct > 0.99 && up >= CFG.TP1_PCT){
-    await paperSell(CFG.TP1_SELL);
-    position.remainingPct = 1 - CFG.TP1_SELL;
-  }
-  if (position.remainingPct <= 0.30){
-    const tstop = trailStopPrice(position);
-    if (p <= tstop){ await paperSell(1.0); return; }
-  }
-  if (down >= CFG.HARD_SL){ await paperSell(1.0); return; }
-  setTimeout(managePositionLoop, CFG.POLL_MS);
-}
-
-async function paperBuy(tokenMint){
-  await sleep(CFG.LATENCY_MS);
-  const lamports = Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL);
-  let q=null; try {
-    q = await jupQuote({ inputMint: CFG.BASE_SOL_MINT, outputMint: tokenMint, amount: lamports, slippageBps: Math.floor(CFG.MAX_SLIPPAGE * 10000) });
-  } catch {}
-  const px = priceFromQuote(q) || (0.000001 + Math.random()*0.000001);
-  const pxFill = px * (1 + CFG.MAX_SLIPPAGE * 0.5);
-  const sizeToken = CFG.TRADE_SIZE_SOL / pxFill;
-  position = { entry: pxFill, sizeToken, high: pxFill, remainingPct: 1.0, tokenMint };
-  const totalCost = CFG.TRADE_SIZE_SOL * (1 + CFG.AMM_FEE_RT) + CFG.PRIORITY_FEE_SOL;
-  csvLog({ event:'paper_buy', side:'BUY', price:pxFill, sol:totalCost, token:sizeToken });
-  console.log(`[PAPER BUY] ${tokenMint} price=${pxFill} tokens=${sizeToken} costSOL≈${totalCost}`);
-  managePositionLoop();
-}
-
-// -------------------- On-chain checks --------------------
-async function onChainChecks(mintAddress){
-  if (CFG.SKIP_ONCHAIN) return { ok:true, info:{ skipped:true } };
-  try {
-    const mintPub = new PublicKey(mintAddress);
-    const mintAcct = await connection.getParsedAccountInfo(mintPub, 'confirmed');
-    const mintData = mintAcct.value?.data?.parsed?.info;
-    const freeze = mintData?.freezeAuthority || null;
-    const mintAuth = mintData?.mintAuthority || null;
-    const supply = Number(mintData?.supply || 0);
-
-    const largest = await connection.getTokenLargestAccounts(mintPub);
-    const arr = largest.value || [];
-    let topPct = 0;
-    if (arr.length){
-      const topAmt = Number(arr[0].amount || 0);
-      const supplyNum = Number(supply || 0) || 1;
-      topPct = topAmt / supplyNum * 100;
-    }
-
-    if (topPct > (100 - CFG.MIN_TOPHOLDERS_PERCENT)) return { ok:false, reason:`Top holder ${topPct.toFixed(2)}%` };
-    if (mintAuth) return { ok:false, reason:`Mint authority present (${mintAuth})` };
-    if (freeze) return { ok:false, reason:`Freeze authority present (${freeze})` };
-
-    return { ok:true, info:{ supply, topPct, freeze, mintAuth } };
-  } catch (e){
-    console.warn('onChainChecks error', e.message);
-    return { ok:false, reason:'onChainChecks failure: ' + e.message };
-  }
-}
-
-// -------------------- AMM filter (patch: accepte CREATE_POOL & PUMP_AMM) --------------------
-function txTouchesKnownAMMPrograms(payload){
-  // liste vide => pas de filtre
+/* --------------- AMM filter ---------------- */
+function txTouchesKnownAMMPrograms(payload) {
+  // Si pas de filtre configuré -> tout passe
   if (!CFG.AMM_PROGRAM_IDS.length) return true;
 
-  // 1) Accepte par type enrichi OU par source Pump AMM
-  if (['SWAP','ADD_LIQUIDITY','REMOVE_LIQUIDITY','CREATE_POOL'].includes(payload?.type)) return true;
+  // Acceptation par type enrichi / source pump
+  if (['SWAP', 'ADD_LIQUIDITY', 'REMOVE_LIQUIDITY', 'WITHDRAW_LIQUIDITY', 'CREATE_POOL'].includes(payload?.type)) {
+    return true;
+  }
   if (payload?.source === 'PUMP_AMM') return true;
 
-  // 2) Recherche de programId dans instructions (top & inner)
+  // Sinon, tente de trouver un des programIds dans les instructions
   const targets = new Set(CFG.AMM_PROGRAM_IDS);
   const seen = new Set();
-
-  const addSeen = (ins) => {
-    if (ins.programId) seen.add(String(ins.programId));
-    const keys = payload?.transaction?.message?.accountKeys || [];
-    if (ins.programIdIndex !== undefined && keys[ins.programIdIndex]) {
-      seen.add(String(keys[ins.programIdIndex]));
+  const keys = payload?.transaction?.message?.accountKeys || [];
+  const addSeen = (ix) => {
+    if (ix?.programId) seen.add(String(ix.programId));
+    if (ix?.programIdIndex !== undefined && keys[ix.programIdIndex]) {
+      seen.add(String(keys[ix.programIdIndex]));
     }
   };
-
-  const msgIns = payload?.transaction?.message?.instructions || [];
-  const inner = payload?.meta?.innerInstructions || [];
-  msgIns.forEach(addSeen);
-  inner.forEach(grp => (grp.instructions||[]).forEach(addSeen));
+  (payload?.transaction?.message?.instructions || []).forEach(addSeen);
+  (payload?.meta?.innerInstructions || []).forEach(grp => (grp.instructions || []).forEach(addSeen));
 
   const ok = [...seen].some(p => targets.has(p));
-  if (!ok) {
-    console.log('AMM filter: skip (no known AMM program / type)'); 
-    console.log('AMM filter skip → seen:', [...seen]);
-  }
+  if (!ok) dbg('AMM filter skip; seen=', [...seen]);
   return ok;
 }
 
-// -------------------- Mint & liquidity (patchés) --------------------
-
-// (1) EXTRACTEUR DE MINT AMÉLIORÉ
-function extractCandidateMintEnhanced(tx) {
+/* ----------- Mint extraction (robuste) ------------ */
+function extractCandidateMint(payload) {
   const found = [];
   const push = (m) => { if (looksLikeMint(m)) found.push(m); };
 
-  // a) Helius tokenTransfers
-  (tx.tokenTransfers || []).forEach(t => push(t.mint));
+  // a) tokenTransfers (top-level Helius)
+  (payload.tokenTransfers || []).forEach(t => push(t.mint));
 
-  // b) Helius accountData[].tokenBalanceChanges[].mint  (ex: Pump AMM CREATE_POOL)
-  (tx.accountData || []).forEach(a => (a.tokenBalanceChanges || []).forEach(c => push(c.mint)));
+  // b) accountData[].tokenBalanceChanges[].mint (Pump AMM & co)
+  (payload.accountData || []).forEach(a =>
+    (a.tokenBalanceChanges || []).forEach(c => push(c.mint))
+  );
 
   // c) postTokenBalances (classique)
-  (tx?.meta?.postTokenBalances || []).forEach(p => push(p.mint));
+  (payload?.meta?.postTokenBalances || []).forEach(p => push(p.mint));
 
-  // d) instructions parsed
-  const msgIns = tx?.transaction?.message?.instructions || [];
-  const inner  = tx?.meta?.innerInstructions || [];
+  // d) instructions parsed info (mint, tokenMint, mintA/B, baseMint, quoteMint, …)
+  const msgIns = payload?.transaction?.message?.instructions || [];
+  const inner  = payload?.meta?.innerInstructions || [];
   const scanIx = (ix) => {
     const info = ix?.parsed?.info || {};
     const guesses = [
@@ -313,182 +144,99 @@ function extractCandidateMintEnhanced(tx) {
     guesses.forEach(push);
   };
   msgIns.forEach(scanIx);
-  inner.forEach(g => (g.instructions || []).forEach(scanIx));
+  inner.forEach(grp => (grp.instructions || []).forEach(scanIx));
 
-  // e) Ultime secours: accountKeys
+  // e) secours: accountKeys
   if (found.length === 0) {
-    (tx?.transaction?.message?.accountKeys || []).forEach(push);
+    (payload?.transaction?.message?.accountKeys || []).forEach(push);
   }
 
-  const uniq = [...new Set(found)].filter(Boolean).filter(m => m !== CFG.BASE_SOL_MINT);
-  const chosen = preferNonBase(uniq);
+  const uniq = [...new Set(found)].filter(Boolean);
+  const chosen = preferNonSOL(uniq);
 
-  if (!chosen) {
-    console.log('No candidate mint found', {
-      hasTokenTransfers: !!tx.tokenTransfers?.length,
-      hasAccountData: !!tx.accountData?.length,
-      hasPostTokenBalances: !!tx?.meta?.postTokenBalances?.length,
-      type: tx?.type, source: tx?.source
+  if (!chosen && LOG_LEVEL === 'debug') {
+    console.log('DEBUG mint not found. Shapes:', {
+      hasTokenTransfers: !!payload.tokenTransfers?.length,
+      hasAccountData: !!payload.accountData?.length,
+      hasPostTokenBalances: !!payload?.meta?.postTokenBalances?.length,
+      type: payload?.type, source: payload?.source
     });
   }
   return chosen;
 }
 
-// (2) ESTIMATION SOL AJOUTÉ AMÉLIORÉE
-function estimateSOLAdded(tx){
+/* ----------- Estimation de la liquidité SOL ---------- */
+function estimateSOLAdded(payload) {
   let lamports = 0;
 
-  // A) Helius nativeTransfers (souvent présent sur CREATE_POOL)
-  if (Array.isArray(tx.nativeTransfers)) {
-    lamports += tx.nativeTransfers.reduce((s, n) => s + Number(n.amount || 0), 0);
+  // A) Helius nativeTransfers (souvent présent sur CREATE_POOL / Pump)
+  if (Array.isArray(payload.nativeTransfers)) {
+    for (const n of payload.nativeTransfers) {
+      lamports += Number(n?.amount || 0);
+    }
   }
 
-  // B) Fallback: scans des instructions parsées "transfer"
-  const top = tx?.transaction?.message?.instructions || [];
-  const inner = tx?.meta?.innerInstructions || [];
-  const scan = (ins)=>{
-    if (ins.parsed?.type === 'transfer' && ins.parsed?.info?.lamports){
+  // B) Fallback: parsed instructions transfer.lamports
+  const top = payload?.transaction?.message?.instructions || [];
+  const inner = payload?.meta?.innerInstructions || [];
+  const scan = (ins) => {
+    if (ins?.parsed?.type === 'transfer' && ins?.parsed?.info?.lamports) {
       lamports += Number(ins.parsed.info.lamports);
     }
   };
   top.forEach(scan);
-  inner.forEach(g => (g.instructions||[]).forEach(scan));
+  inner.forEach(grp => (grp.instructions || []).forEach(scan));
 
-  return lamports / LAMPORTS_PER_SOL;
+  return lamports / 1_000_000_000; // SOL
 }
 
-// -------------------- Simulate Jupiter swap (anti-honeypot) --------------------
-async function buildSwapTransactionBase64(tokenMint){
-  const lamports = Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL);
-  const quote = await jupQuote({
-    inputMint: CFG.BASE_SOL_MINT,
-    outputMint: tokenMint,
-    amount: lamports,
-    slippageBps: Math.floor(CFG.MAX_SLIPPAGE * 10000)
-  });
-  if (!quote?.data?.length) throw new Error('No route from Jupiter');
-
-  // Fake user pubkey pour construire la tx (Jupiter génère les ix; on ne va pas l'envoyer ici)
-  const fake = Keypair.generate();
-  const body = {
-    quoteResponse: quote,
-    userPublicKey: fake.publicKey.toBase58(),
-    wrapAndUnwrapSOL: true,
-    prioritizationFeeLamports: Math.max(0, Math.floor(CFG.PRIORITY_FEE_SOL * LAMPORTS_PER_SOL))
-  };
-  const res = await fetch(CFG.JUP_S_URL, {
-    method:'POST',
-    headers:{ 'Content-Type':'application/json' },
-    body: JSON.stringify(body)
-  });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`swap build fail: ${txt}`);
-  }
-  const data = await res.json();
-  if (!data?.swapTransaction) throw new Error('no swapTransaction in response');
-  return data.swapTransaction; // base64
-}
-
-async function simulateJupiterSwapBase64(swapTransactionBase64){
-  const buf = Buffer.from(swapTransactionBase64, 'base64');
-  const vtx = VersionedTransaction.deserialize(buf);
-  const fake = Keypair.generate(); // signature fictive
-  vtx.sign([fake]);
-  const sim = await connection.simulateTransaction(vtx, { sigVerify: false });
-  if (sim?.value?.err){
-    throw new Error('simulateTransaction error: ' + JSON.stringify(sim.value.err));
-  }
-  return true;
-}
-
-// -------------------- Live executor client --------------------
-async function execBuyViaHotExecutor({ swapTransactionBase64 }){
-  if (!CFG.EXECUTOR_URL) throw new Error("Missing EXECUTOR_URL in env for live mode");
-  const res = await fetch(`${CFG.EXECUTOR_URL}/buy`, {
-    method: 'POST',
-    headers: { 'Content-Type':'application/json' },
-    body: JSON.stringify({ swapTransactionBase64 })
-  });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`Executor error ${res.status}: ${txt}`);
-  }
-  return res.json(); // { ok, results, sig }
-}
-
-// -------------------- Express server --------------------
+/* ----------------- Server ------------------ */
 const app = express();
 app.use(bodyParser.json({
-  limit:'1mb',
-  verify: (req, res, buf) => { req.rawBody = buf; }
+  limit: '2mb',
+  verify: (req, _res, buf) => { req.rawBody = buf; }
 }));
 
-app.get('/health', (req,res) => res.send({ ok:true, mode: CFG.MODE }));
+app.get('/health', (_req, res) => {
+  res.send({ ok: true, service: 'helius-mint-listener', filterPrograms: CFG.AMM_PROGRAM_IDS.length });
+});
 
 app.post('/helius-webhook', async (req, res) => {
   try {
     if (!verifyHelius(req, req.rawBody)) {
-      return res.status(401).send({ ok:false, error:'Invalid Helius signature' });
+      return res.status(401).send({ ok: false, error: 'Invalid Helius signature' });
     }
 
     const payload = Array.isArray(req.body) ? req.body[0] : req.body;
 
-    // Filtre AMM (patch)
+    // Filtre AMM (si configuré)
     if (!txTouchesKnownAMMPrograms(payload)) {
-      return res.status(200).send({ ok:true, note:'amm-filter-skip' });
+      return res.status(200).send({ ok: true, note: 'amm-filter-skip' });
     }
 
-    // Détection mint & liquidité (patchés)
-    const mint = extractCandidateMintEnhanced(payload);
+    const mint = extractCandidateMint(payload);
     const solAdded = estimateSOLAdded(payload);
-    if (!mint) return res.status(200).send({ ok:true, note:'no-mint' });
-    if (solAdded < CFG.MIN_LIQUIDITY_SOL) {
-      return res.status(200).send({ ok:true, note:'low-liquidity', solAdded });
-    }
+    const info = {
+      type: payload?.type || null,
+      source: payload?.source || null,
+      signature: payload?.signature || null,
+      slot: payload?.slot || null,
+      solAdded,
+    };
 
-    // Checks on-chain
-    const checks = await onChainChecks(mint);
-    if (!checks.ok) {
-      csvLog({ event:'rejected', side:'CHECK_FAIL', token: mint, pnl: checks.reason });
-      return res.status(200).send({ ok:true, note:'chain-check-fail', reason: checks.reason });
-    }
-
-    // Build swap + simulate
-    let swapB64;
-    try {
-      swapB64 = await buildSwapTransactionBase64(mint);
-      await simulateJupiterSwapBase64(swapB64);
-    } catch (e) {
-      console.log('simulate/build fail:', e.message);
-      return res.status(200).send({ ok:true, note:'simulate-fail', err: e.message });
-    }
-
-    // Trigger selon le mode
-    if (CFG.MODE === 'live') {
-      console.log('LIVE mode -> sending to executor…');
-      csvLog({ event:'trigger', side:'LIVE_BUY', token: mint, sol: CFG.TRADE_SIZE_SOL });
-      try {
-        const execRes = await execBuyViaHotExecutor({ swapTransactionBase64: swapB64 });
-        console.log('Executor response:', execRes);
-        return res.status(200).send({ ok:true, note:'live-triggered', mint, solAdded, exec: execRes });
-      } catch (e) {
-        console.error('Live buy failed:', e.message);
-        return res.status(500).send({ ok:false, error: e.message });
-      }
+    if (mint) {
+      log(`🚀 Nouveau token détecté: ${mint} | type=${info.type} source=${info.source} | ~${solAdded.toFixed(4)} SOL ajoutés`);
+      return res.status(200).send({ ok: true, token: mint, ...info });
     } else {
-      // PAPER
-      csvLog({ event:'trigger', side:'BUY', token: mint, sol: CFG.TRADE_SIZE_SOL });
-      await paperBuy(mint);
-      return res.status(200).send({ ok:true, note:'paper-triggered', mint, solAdded });
+      log(`⚠️ Aucun mint détecté | type=${info.type} source=${info.source} | ~${solAdded.toFixed(4)} SOL ajoutés`);
+      return res.status(200).send({ ok: true, note: 'no-mint', ...info });
     }
-
   } catch (e) {
     console.error('webhook error:', e);
-    res.status(500).send({ ok:false, error: e.message });
+    return res.status(500).send({ ok: false, error: e.message });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Webhook listener on :${PORT} — mode=${CFG.MODE}`);
+  console.log(`Mint listener running on :${PORT} (LOG_LEVEL=${LOG_LEVEL})`);
 });
