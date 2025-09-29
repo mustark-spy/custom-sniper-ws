@@ -35,8 +35,9 @@ const CFG = {
   TP1_SELL: Number(process.env.TP1_SELL || 0.70),
   TRAIL_GAP: Number(process.env.TRAIL_GAP || 0.15),
   HARD_SL: Number(process.env.HARD_SL || 0.35),
+
+  // Mettre 0 pour désactiver la sortie forcée
   EXIT_TIMEOUT_MS: Number(process.env.EXIT_TIMEOUT_MS || 15000),
-  
 
   // Jupiter
   JUP_Q_URL: process.env.JUPITER_QUOTE_URL || 'https://quote-api.jup.ag/v6/quote',
@@ -221,7 +222,7 @@ async function paperEnter(mint, entryGuessSOLPerToken) {
   console.log(`🟢 [ENTER] ${mint} @ ${fmt(fill)} SOL/token | size=${fmt(sizeToken)} tok`);
   csv({ event:'enter', side:'BUY', price:fill, sol:estCost, token:sizeToken, extra:mint });
 
-  // boucle de gestion (TP/SL/trailing) + timeout dur
+  // boucle de gestion (TP/SL/trailing) + timeout dur (optionnel)
   managePositionLoop().catch(()=>{});
   if (CFG.EXIT_TIMEOUT_MS > 0) {
     setTimeout(() => {
@@ -230,6 +231,7 @@ async function paperEnter(mint, entryGuessSOLPerToken) {
         paperExit(1.0).catch(()=>{});
       }
     }, CFG.EXIT_TIMEOUT_MS);
+  }
 }
 
 async function paperExit(pct) {
@@ -277,10 +279,6 @@ async function managePositionLoop() {
     await sleep(200); // loop rapide
   }
 }
-
-// -------------------- (Optionnel) exécution live via un exécuteur interne --------------------
-// const EXECUTOR_URL = process.env.EXECUTOR_URL || '';
-// async function liveEnterWithExecutor(mint) { ... }
 
 // -------------------- Webhook --------------------
 const app = express();
