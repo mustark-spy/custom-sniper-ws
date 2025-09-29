@@ -1,25 +1,9 @@
 /**
- * Snipe webhook -> entrée auto si add_liquidity >= seuil puis scalp 0.15 SOL
- * Paper trading par défaut (MODE=paper). Log CSV + console.
- *
- * ENV clefs:
- *  MODE=paper|live
- *  PORT=10000
- *  RPC_URL=...
- *  BASE_SOL_MINT=So11111111111111111111111111111111111111112
- *  TRIGGER_MIN_SOL=200
- *  TRADE_SIZE_SOL=0.15
- *  MAX_SLIPPAGE=0.30
- *  PRIORITY_FEE_SOL=0.008
- *  TP1_PCT=0.40
- *  TP1_SELL=0.70
- *  TRAIL_GAP=0.15
- *  HARD_SL=0.35
- *  EXIT_TIMEOUT_MS=15000    // 0 pour désactiver
- *  JUPITER_QUOTE_URL=https://quote-api.jup.ag/v6/quote
- *  AMM_PROGRAM_IDS=comma,separated,programIds (optionnel)
- *  CSV_FILE=paper_trades.csv
- *  LOG_LEVEL=debug|info
+ * Helius webhook -> détection pools + scalp paper
+ * - Traite tableaux d'events
+ * - AMM_STRICT=0 (par défaut) : accepte par type (CREATE_POOL/ADD_LIQUIDITY) même si whitelist ne matche pas
+ * - AMM_STRICT=1 : refuse si program non whiteliste
+ * - LOG_LEVEL=debug pour voir les programmes "vus"
  */
 
 import 'dotenv/config';
@@ -32,44 +16,47 @@ import {
   LAMPORTS_PER_SOL,
 } from '@solana/web3.js';
 
-// -------------------- Config --------------------
+/* ===================== Config ===================== */
 const CFG = {
-  MODE: (process.env.MODE || 'paper').toLowerCase(), // 'paper' | 'live'
+  MODE: (process.env.MODE || 'paper').toLowerCase(),      // paper | live
   PORT: Number(process.env.PORT || 10000),
+
   RPC_URL: process.env.RPC_URL || 'https://api.mainnet-beta.solana.com',
   BASE_SOL_MINT: process.env.BASE_SOL_MINT || 'So11111111111111111111111111111111111111112',
 
-  // Déclencheur
+  // Déclencheur (min SOL ajoutés pour entrer)
   TRIGGER_MIN_SOL: Number(process.env.TRIGGER_MIN_SOL || 200),
 
-  // Trade params
+  // Params “paper” (scalp)
   TRADE_SIZE_SOL: Number(process.env.TRADE_SIZE_SOL || 0.15),
   MAX_SLIPPAGE: Number(process.env.MAX_SLIPPAGE || 0.30),
   PRIORITY_FEE_SOL: Number(process.env.PRIORITY_FEE_SOL || 0.008),
-
   TP1_PCT: Number(process.env.TP1_PCT || 0.40),
   TP1_SELL: Number(process.env.TP1_SELL || 0.70),
   TRAIL_GAP: Number(process.env.TRAIL_GAP || 0.15),
   HARD_SL: Number(process.env.HARD_SL || 0.35),
-
-  // Mettre 0 pour désactiver la sortie forcée
-  EXIT_TIMEOUT_MS: Number(process.env.EXIT_TIMEOUT_MS || 15000),
+  EXIT_TIMEOUT_MS: Number(process.env.EXIT_TIMEOUT_MS || 15000), // mettre 0 pour désactiver
 
   // Jupiter
   JUP_Q_URL: process.env.JUPITER_QUOTE_URL || 'https://quote-api.jup.ag/v6/quote',
 
-  // AMM whitelist optionnelle
+  // Filtre AMM (whitelist) + sévérité
   AMM_PROGRAM_IDS: (process.env.AMM_PROGRAM_IDS || '')
     .split(',')
     .map(s => s.trim())
     .filter(Boolean),
+  AMM_STRICT: Number(process.env.AMM_STRICT || 0),        // 0 = souple (fallback par type), 1 = strict
 
+  // Logs
+  LOG_LEVEL: (process.env.LOG_LEVEL || 'info').toLowerCase(),
+
+  // CSV
   CSV_FILE: process.env.CSV_FILE || 'paper_trades.csv',
 };
 
 const connection = new Connection(CFG.RPC_URL, { commitment: 'confirmed' });
 
-// CSV boot
+/* ===================== CSV ===================== */
 if (!fs.existsSync(CFG.CSV_FILE)) {
   fs.writeFileSync(CFG.CSV_FILE, 'time,event,side,price,sol,token,extra\n');
 }
@@ -78,11 +65,11 @@ const csv = (r) => {
   fs.appendFileSync(CFG.CSV_FILE, line);
 };
 
-// -------------------- Utils --------------------
+const dbg = (...a) => { if (CFG.LOG_LEVEL === 'debug') console.log(...a); };
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fmt = (n) => Number(n).toFixed(6);
 
-// Récup prix spot via Jupiter (si route dispo). amount = lamports input.
+/* ===================== Jupiter ===================== */
 async function jupSpotPrice({ inputMint, outputMint, amountLamports, slippageBps }) {
   const url = new URL(CFG.JUP_Q_URL);
   url.searchParams.set('inputMint', inputMint);
@@ -99,33 +86,29 @@ async function jupSpotPrice({ inputMint, outputMint, amountLamports, slippageBps
   if (!r) throw new Error('No route');
   const inAmt = Number(r.inAmount) / (10 ** (r.inAmountDecimals ?? 9));
   const outAmt = Number(r.outAmount) / (10 ** (r.outAmountDecimals ?? 9));
-  // SOL per TOKEN
-  return inAmt / outAmt;
+  return inAmt / outAmt; // SOL per TOKEN
 }
 
-// -------------------- Extraction depuis le payload Helius --------------------
-
-// 1) Mint candidat: on prend le mint qui a été crédité côté pool (post > pre)
+/* ===================== Extraction ===================== */
 function extractMint(payload) {
-  // Format "enhanced" => accountData[].tokenBalanceChanges
+  // 1) Helius enhanced: accountData[].tokenBalanceChanges[]
   const acc = payload?.accountData || [];
   const deltas = new Map();
   for (const a of acc) {
     for (const t of (a.tokenBalanceChanges || [])) {
       const mint = t.mint;
       const raw = Number(t.rawTokenAmount?.tokenAmount || 0);
-      // On comptabilise seulement les crédits (raw > 0) vers des comptes non-user typés pool
       if (raw > 0) {
-        deltas.set(mint, (deltas.get(mint) || 0) + raw / (10 ** (t.rawTokenAmount?.decimals ?? 9)));
+        const dec = Number(t.rawTokenAmount?.decimals ?? 9);
+        deltas.set(mint, (deltas.get(mint) || 0) + raw / (10 ** dec));
       }
     }
   }
   if (deltas.size) {
-    // mint le plus crédité
     return [...deltas.entries()].sort((a,b)=>b[1]-a[1])[0][0];
   }
 
-  // fallback sur pre/post balances legacy
+  // 2) Legacy: pre/post balances
   const pre = payload?.meta?.preTokenBalances || [];
   const post = payload?.meta?.postTokenBalances || [];
   const byMint = {};
@@ -141,18 +124,17 @@ function extractMint(payload) {
   return cand.length ? cand[0][0] : null;
 }
 
-// 2) SOL ajoutés: try enhanced, sinon parse lamports des instructions
 function estimateSolAdded(payload) {
-  // Source enhanced: tokenTransfers SOL
+  // Enhanced: tokenTransfers
   const solMint = CFG.BASE_SOL_MINT;
   const t = payload?.tokenTransfers || [];
   let by = 0;
   for (const x of t) {
-    if (x.mint === solMint && x.tokenAmount > 0) by += Number(x.tokenAmount);
+    if (x.mint === solMint && Number(x.tokenAmount) > 0) by += Number(x.tokenAmount);
   }
   if (by > 0) return by;
 
-  // fallback via inner parsed lamports
+  // Fallback: transfer lamports parsed
   let lamports = 0;
   const top = payload?.transaction?.message?.instructions || [];
   const inner = payload?.meta?.innerInstructions || [];
@@ -165,39 +147,60 @@ function estimateSolAdded(payload) {
   return lamports / LAMPORTS_PER_SOL;
 }
 
-// 3) Filtre AMM: si whitelist fournie
-function ammAllowed(payload) {
-  if (!CFG.AMM_PROGRAM_IDS.length) return true;
+/* ===================== AMM filter ===================== */
+function ammAllowedStrict(payload) {
+  if (!CFG.AMM_PROGRAM_IDS.length) return true; // pas de whitelist => tout passe
+
   const set = new Set(CFG.AMM_PROGRAM_IDS);
 
-  // Enhanced: payload.programId + type
-  if (payload?.programId && set.has(String(payload.programId))) return true;
+  // Enhanced shortcut
+  if (payload?.programId && set.has(String(payload.programId))) {
+    dbg('[amm] match programId (enhanced):', payload.programId);
+    return true;
+  }
 
-  // Legacy: via accountKeys/programIdIndex
+  // Legacy scan
   const keys = payload?.transaction?.message?.accountKeys || [];
-  const addrs = new Set();
-  // top
-  for (const ins of (payload?.transaction?.message?.instructions || [])) {
-    if (ins.programId) addrs.add(String(ins.programId));
-    if (ins.programIdIndex !== undefined && keys[ins.programIdIndex]) {
-      addrs.add(String(keys[ins.programIdIndex]));
+  const seen = new Set();
+
+  const addSeen = (ix) => {
+    if (ix.programId) seen.add(String(ix.programId));
+    if (ix.programIdIndex !== undefined && keys[ix.programIdIndex]) {
+      seen.add(String(keys[ix.programIdIndex]));
     }
-  }
-  // inner
-  for (const grp of (payload?.meta?.innerInstructions || [])) {
-    for (const ins of (grp.instructions || [])) {
-      if (ins.programId) addrs.add(String(ins.programId));
-      if (ins.programIdIndex !== undefined && keys[ins.programIdIndex]) {
-        addrs.add(String(keys[ins.programIdIndex]));
-      }
-    }
-  }
-  for (const a of addrs) if (set.has(a)) return true;
+  };
+
+  for (const ix of (payload?.transaction?.message?.instructions || [])) addSeen(ix);
+  for (const grp of (payload?.meta?.innerInstructions || [])) for (const ix of (grp.instructions||[])) addSeen(ix);
+
+  dbg('[amm] seen programs =>', [...seen]);
+  for (const p of seen) if (set.has(p)) return true;
+
   return false;
 }
 
-// -------------------- Paper trading (entrée <-> sortie en 15s max) --------------------
-let openPos = null; // { mint, entry, sizeToken, high, remainingPct, startedAt }
+function ammAccepted(payload) {
+  // si strict => doit matcher la whitelist
+  if (CFG.AMM_STRICT) return ammAllowedStrict(payload);
+
+  // sinon: fallback type
+  if (['CREATE_POOL','ADD_LIQUIDITY','REMOVE_LIQUIDITY','SWAP'].includes(payload?.type)) {
+    // si whitelist existe ET matche => ok
+    if (CFG.AMM_PROGRAM_IDS.length) {
+      const ok = ammAllowedStrict(payload);
+      if (ok) return true;
+      // sinon on accepte quand même (mode souple)
+      dbg('amm filter: fallback by type (non-strict)');
+      return true;
+    }
+    return true;
+  }
+  // dernier filet: strict check
+  return ammAllowedStrict(payload);
+}
+
+/* ===================== Paper engine ===================== */
+let openPos = null; // { mint, entry, sizeToken, high, remainingPct }
 
 function trailStopPrice(p) { return p.high * (1 - CFG.TRAIL_GAP); }
 
@@ -206,47 +209,26 @@ async function spotPriceOrFallback(mint, fallback) {
   const bps = Math.floor(CFG.MAX_SLIPPAGE * 10000);
   for (let i=0; i<5; i++) {
     try {
-      const px = await jupSpotPrice({
-        inputMint: CFG.BASE_SOL_MINT,
-        outputMint: mint,
-        amountLamports: lamports,
-        slippageBps: bps,
-      });
+      const px = await jupSpotPrice({ inputMint: CFG.BASE_SOL_MINT, outputMint: mint, amountLamports: lamports, slippageBps: bps });
       return px;
-    } catch {
-      await sleep(250); // Jupiter pas prêt => on réessaie vite
-    }
+    } catch { await sleep(200); }
   }
-  return fallback; // on utilise l’estimation d’entrée
+  return fallback;
 }
 
-async function paperEnter(mint, entryGuessSOLPerToken) {
-  const px = await spotPriceOrFallback(mint, entryGuessSOLPerToken);
+async function paperEnter(mint, entryGuess) {
+  const px = await spotPriceOrFallback(mint, entryGuess || 0.000001);
   const fill = px * (1 + 0.5 * CFG.MAX_SLIPPAGE);
   const sizeToken = CFG.TRADE_SIZE_SOL / fill;
 
-  openPos = {
-    mint,
-    entry: fill,
-    sizeToken,
-    high: fill,
-    remainingPct: 1.0,
-    startedAt: Date.now(),
-  };
+  openPos = { mint, entry: fill, sizeToken, high: fill, remainingPct: 1.0 };
 
-  const estCost = CFG.TRADE_SIZE_SOL + CFG.PRIORITY_FEE_SOL;
   console.log(`🟢 [ENTER] ${mint} @ ${fmt(fill)} SOL/token | size=${fmt(sizeToken)} tok`);
-  csv({ event:'enter', side:'BUY', price:fill, sol:estCost, token:sizeToken, extra:mint });
+  csv({ event:'enter', side:'BUY', price:fill, sol:CFG.TRADE_SIZE_SOL + CFG.PRIORITY_FEE_SOL, token:sizeToken, extra:mint });
 
-  // boucle de gestion (TP/SL/trailing) + timeout dur (optionnel)
   managePositionLoop().catch(()=>{});
   if (CFG.EXIT_TIMEOUT_MS > 0) {
-    setTimeout(() => {
-      if (openPos) {
-        console.log(`⏳ Timeout ${CFG.EXIT_TIMEOUT_MS}ms -> close remaining`);
-        paperExit(1.0).catch(()=>{});
-      }
-    }, CFG.EXIT_TIMEOUT_MS);
+    setTimeout(() => { if (openPos) { console.log(`⏳ Timeout ${CFG.EXIT_TIMEOUT_MS}ms -> close remaining`); paperExit(1); } }, CFG.EXIT_TIMEOUT_MS);
   }
 }
 
@@ -260,7 +242,7 @@ async function paperExit(pct) {
   const pnl = proceedsSOL - costSOL;
 
   openPos.sizeToken -= sellTok;
-  console.log(`🔴 [EXIT] ${openPos.mint} sell=${fmt(sellTok)} @ ${fmt(fill)} => pnl=${fmt(pnl)} SOL`);
+  console.log(`🔴 [EXIT] ${openPos.mint} sell=${fmt(sellTok)} @ ${fmt(fill)} ⇒ pnl=${fmt(pnl)} SOL`);
   csv({ event:'exit', side:'SELL', price:fill, sol:proceedsSOL, token:sellTok, extra:`pnl=${pnl}` });
 
   if (openPos.sizeToken <= 1e-12) openPos = null;
@@ -274,37 +256,23 @@ async function managePositionLoop() {
     const up = mark / openPos.entry - 1;
     const down = 1 - mark / openPos.entry;
 
-    // TP1: +40% => vend 70%
     if (openPos.remainingPct > 0.99 && up >= CFG.TP1_PCT) {
       await paperExit(CFG.TP1_SELL);
       openPos.remainingPct = 1 - CFG.TP1_SELL;
     }
+    if (openPos.remainingPct <= 0.30 && mark <= trailStopPrice(openPos)) { await paperExit(1.0); break; }
+    if (down >= CFG.HARD_SL) { await paperExit(1.0); break; }
 
-    // trailing sur le reste
-    if (openPos.remainingPct <= 0.30 && mark <= trailStopPrice(openPos)) {
-      await paperExit(1.0);
-      break;
-    }
-
-    // SL dur
-    if (down >= CFG.HARD_SL) {
-      await paperExit(1.0);
-      break;
-    }
-
-    await sleep(200); // loop rapide
+    await sleep(200);
   }
 }
 
-// -------------------- Webhook (robuste & verbeux) --------------------
+/* ===================== Server ===================== */
 const app = express();
 
-// 1) parsers: JSON + fallback texte (si content-type non standard)
-app.use(bodyParser.json({ limit: '25mb' }));              // batch Helius peut être lourd
-app.use(bodyParser.text({ type: '*/*', limit: '25mb' })); // fallback si JSON échoue
-
-// 2) trap d’erreur “too large” + log
-app.use((err, req, res, next) => {
+// Parse JSON (agrandi + log taille)
+app.use(bodyParser.json({ limit: '20mb' }));
+app.use((err, _req, res, next) => {
   if (err?.type === 'entity.too.large') {
     console.error('Body too large:', err.message);
     return res.status(413).send('Body too large');
@@ -312,111 +280,84 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-const LOG_DEBUG = (process.env.LOG_LEVEL || 'info').toLowerCase() === 'debug';
-const seenMint = new Map(); // mint => ts
+// petit middleware debug pour mesurer les batchs & tailles
+app.post('/helius-webhook', (req, _res, next) => {
+  const body = req.body;
+  const batchLen = Array.isArray(body) ? body.length : 1;
+  const size = Buffer.byteLength(JSON.stringify(body || {}));
+  dbg('[hit] batchLen=', batchLen);
+  dbg('[hit] /helius-webhook bodySize=' + size + 'B');
+  next();
+});
 
-// util: parser robuste
-function parseHeliusBody(req) {
-  try {
-    // cas normal: body déjà objet/array
-    if (Array.isArray(req.body) || (req.body && typeof req.body === 'object')) {
-      return req.body;
-    }
-    // fallback: body texte -> JSON.parse
-    if (typeof req.body === 'string' && req.body.trim().length) {
-      return JSON.parse(req.body);
-    }
-  } catch (e) {
-    console.error('JSON parse error:', e.message);
-  }
-  return null;
-}
+// de-dup courte durée
+const seenMintTs = new Map(); // mint => ts
 
 app.post('/helius-webhook', async (req, res) => {
-  // LOG: hit minimal
-  const rawLen =
-    typeof req.body === 'string'
-      ? Buffer.byteLength(req.body, 'utf8')
-      : Buffer.byteLength(JSON.stringify(req.body || ''), 'utf8');
-  if (LOG_DEBUG) console.log(`[hit] /helius-webhook bodySize=${rawLen}B`);
-
-  const parsed = parseHeliusBody(req);
-  if (!parsed) {
-    console.warn('Webhook hit but body is empty or unparsable');
-    return res.status(400).send({ ok: false, error: 'unparsable-body' });
-  }
-
-  const batch = Array.isArray(parsed) ? parsed : [parsed];
-  if (LOG_DEBUG) console.log(`[hit] batchLen=${batch.length}`);
-
   try {
-    for (const payload of batch) {
+    const items = Array.isArray(req.body) ? req.body : [req.body];
+
+    for (const payload of items) {
       const t = payload?.type || 'UNKNOWN';
-      const src = payload?.source || 'unknown';
 
-      if (!['CREATE_POOL', 'ADD_LIQUIDITY'].includes(t)) {
-        if (LOG_DEBUG) console.log(`skip: ignored-type (${t})`);
+      // filtre AMM (souple/strict)
+      if (!ammAccepted(payload)) {
+        dbg('skip: amm-filter-skip');
         continue;
       }
 
-      if (!ammAllowed(payload)) {
-        if (LOG_DEBUG) console.log('skip: amm-filter-skip');
-        continue;
-      }
+      // types utiles
+      if (!['CREATE_POOL','ADD_LIQUIDITY'].includes(t)) continue;
 
       const mint = extractMint(payload);
       const added = estimateSolAdded(payload);
+      const src = payload?.source || 'unknown';
       const slot = payload?.slot;
 
-      if (!mint) {
-        if (LOG_DEBUG) console.log('skip: No candidate mint found');
-        continue;
-      }
+      if (!mint) { console.log('No candidate mint found'); continue; }
 
-      console.log(
-        `🚀 Nouveau token détecté: ${mint} | type=${t}  source=${src} | ~${fmt(added)} SOL ajoutés`
-      );
+      console.log(`🚀 Nouveau token détecté: ${mint} | type=${t}  source=${src} | ~${fmt(added)} SOL ajoutés`);
       csv({ event:'detect', side:'', price:'', sol:added, token:mint, extra:`type=${t}|source=${src}|slot=${slot}` });
 
+      // anti double-traitement 30s
       const now = Date.now();
-      const last = seenMint.get(mint);
-      if (last && now - last < 30000) {
-        if (LOG_DEBUG) console.log(`cooldown: already seen ${mint} (${now - last}ms)`);
-        continue;
-      }
-      seenMint.set(mint, now);
+      if (seenMintTs.get(mint) && now - seenMintTs.get(mint) < 30000) continue;
+      seenMintTs.set(mint, now);
 
       if (added >= CFG.TRIGGER_MIN_SOL && CFG.MODE === 'paper') {
-        const lamports = Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL);
+        // tentative de price d’entrée
         let entryGuess = 0.000001;
         try {
           entryGuess = await jupSpotPrice({
             inputMint: CFG.BASE_SOL_MINT,
             outputMint: mint,
-            amountLamports: lamports,
+            amountLamports: Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL),
             slippageBps: Math.floor(CFG.MAX_SLIPPAGE * 10000),
           });
-        } catch (e) {
-          if (LOG_DEBUG) console.log(`quote miss (fallback) for ${mint}:`, e.message);
-        }
+        } catch {}
+
         await paperEnter(mint, entryGuess);
-        if (LOG_DEBUG) console.log(`triggered: paper enter ${mint} (added=${fmt(added)} SOL)`);
-      } else {
-        if (LOG_DEBUG) console.log(`logged: below trigger or not paper (added=${fmt(added)} SOL)`);
       }
     }
 
-    return res.status(200).send({ ok: true });
+    return res.status(200).send({ ok:true });
   } catch (e) {
-    console.error('webhook handler error:', e);
-    return res.status(500).send({ ok: false, error: e.message });
+    console.error('webhook error', e);
+    return res.status(500).send({ ok:false, error: e.message });
   }
 });
 
-app.get('/health', (_req, res) =>
-  res.send({ ok:true, mode: CFG.MODE, triggerMinSol: CFG.TRIGGER_MIN_SOL })
-);
+app.get('/health', (_req, res) => {
+  res.send({
+    ok: true,
+    mode: CFG.MODE,
+    triggerMinSol: CFG.TRIGGER_MIN_SOL,
+    ammStrict: CFG.AMM_STRICT,
+    whitelist: CFG.AMM_PROGRAM_IDS,
+    logLevel: CFG.LOG_LEVEL,
+  });
+});
 
 app.listen(CFG.PORT, () => {
-  console.log(`Webhook listener on :${CFG.PORT} — mode=${CFG.MODE} (LOG_LEVEL=${process.env.LOG_LEVEL || 'info'})`);
+  console.log(`Mint listener running on :${CFG.PORT} (LOG_LEVEL=${CFG.LOG_LEVEL})`);
 });
