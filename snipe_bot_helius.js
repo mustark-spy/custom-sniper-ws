@@ -282,10 +282,21 @@ async function managePositionLoop() {
 
 // -------------------- Webhook --------------------
 const app = express();
-app.use(bodyParser.json({ limit:'20mb' }));
-
+app.use(bodyParser.json({ limit: '20mb' }));   // ou 20mb si tu veux être large
+app.use((err, req, res, next) => {
+  if (err?.type === 'entity.too.large') {
+    console.error('Body too large:', err.message);
+    return res.status(413).send('Body too large');
+  }
+  next(err);
+});
 // anti re-fire: on ne traite qu’une fois par mint (cooldown court)
 const seenMint = new Map(); // mint => ts
+
+app.post('/helius-webhook', (req, res, next) => {
+  if (!req.body) console.warn('Webhook hit but req.body is empty or failed to parse');
+  next();
+});
 
 app.post('/helius-webhook', async (req, res) => {
   try {
