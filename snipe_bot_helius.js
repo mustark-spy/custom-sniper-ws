@@ -193,7 +193,7 @@ async function pumpTradeLocalBuildTx({ mint, solAmount, slippagePct }) {
   });
   if (!res.ok) {
     const t = await res.text();
-    throw new Error(`pump trade-local ${res.status}: JSON.stringify(${res})`);
+    throw new Error(`pump trade-local ${res.status}: ` + JSON.stringify(res));
   }
   // Renvoie un binaire (arrayBuffer) représentant la tx v0
   const buf = new Uint8Array(await res.arrayBuffer());
