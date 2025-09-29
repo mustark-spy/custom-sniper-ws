@@ -1,6 +1,8 @@
 /**
  * Webhook Helius -> Achat live ultra-rapide (Pump Portal d'abord si PUMP_AMM, sinon Jupiter) -> TP/SL/Trailing
- * + Injection de TIP Jito (require: INCLUDE_TIP, TIP_LAMPORTS >= 1_000_000, TIP_ACCOUNTS) pour Helius Sender.
+ * - Support Pump Portal avec PUMP_API_KEY (header Authorization: Bearer ...)
+ * - Envoi via Helius Sender
+ * - Tip optionnel vers un "tip account" Helius (INCLUDE_TIP/TIP_LAMPORTS/TIP_ACCOUNTS)
  */
 
 import 'dotenv/config';
@@ -14,9 +16,9 @@ import {
   LAMPORTS_PER_SOL,
   VersionedTransaction,
   Keypair,
-  PublicKey,
   SystemProgram,
   TransactionMessage,
+  PublicKey,
 } from '@solana/web3.js';
 
 // -------------------- Config --------------------
@@ -42,27 +44,28 @@ const CFG = {
   JUP_Q_URL: process.env.JUPITER_QUOTE_URL || 'https://quote-api.jup.ag/v6/quote',
   JUP_S_URL: process.env.JUPITER_SWAP_URL || 'https://quote-api.jup.ag/v6/swap',
 
-  // Pump Portal (pumpswap) – utilisé quand source=PUMP_AMM ou pAMM détecté
+  // Pump Portal (pumpswap)
   PUMP_PORTAL_URL: process.env.PUMP_PORTAL_URL || 'https://pumpportal.fun/api/trade',
-  PUMP_PRIORITY_FEE_LAMPORTS: Number(process.env.PUMP_PRIORITY_FEE_LAMPORTS || 0), // 0 => on utilise PRIORITY_FEE_SOL
+  PUMP_PRIORITY_FEE_LAMPORTS: Number(process.env.PUMP_PRIORITY_FEE_LAMPORTS || 0),
+  PUMP_API_KEY: process.env.PUMP_API_KEY || '',
 
-  // Helius Sender (relay ultra-rapide)
+  // Helius Sender
   HELIUS_SENDER_URL: process.env.HELIUS_SENDER_URL || '',
+
+  // Tip (Helius docs: inclure un transfer vers un tip account dans la transaction)
+  INCLUDE_TIP: ['1', 'true', 'yes'].includes(String(process.env.INCLUDE_TIP || '').toLowerCase()),
+  TIP_LAMPORTS: Number(process.env.TIP_LAMPORTS || 1_000_000), // 0.001 SOL par défaut (min recommandé)
+  TIP_ACCOUNTS: (process.env.TIP_ACCOUNTS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean),
 
   // AMM allowlist
   AMM_PROGRAM_IDS: (process.env.AMM_PROGRAM_IDS || '')
     .split(',')
     .map(s => s.trim())
     .filter(Boolean),
-  AMM_STRICT: ['1','true','yes'].includes(String(process.env.AMM_STRICT || '').toLowerCase()),
-
-  // ---- Tip Jito (Helius Sender) ----
-  INCLUDE_TIP: ['1','true','yes'].includes(String(process.env.INCLUDE_TIP || '0').toLowerCase()),
-  TIP_LAMPORTS: Number(process.env.TIP_LAMPORTS || 0), // ex: 1_000_000 = 0.001 SOL
-  TIP_ACCOUNTS: (process.env.TIP_ACCOUNTS || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean),
+  AMM_STRICT: ['1', 'true', 'yes'].includes(String(process.env.AMM_STRICT || '').toLowerCase()),
 
   WALLET_SECRET_KEY: process.env.WALLET_SECRET_KEY || '', // base58
   CSV_FILE: process.env.CSV_FILE || 'live_trades.csv',
@@ -96,51 +99,6 @@ function csv(row) {
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fmt = (n) => Number(n).toFixed(6);
-
-// -------------------- Tip helpers --------------------
-function shouldTip() {
-  return CFG.INCLUDE_TIP && CFG.TIP_LAMPORTS >= 1_000_000 && CFG.TIP_ACCOUNTS.length > 0;
-}
-function pickTipAccount() {
-  if (!CFG.TIP_ACCOUNTS.length) return null;
-  return CFG.TIP_ACCOUNTS[Math.floor(Math.random() * CFG.TIP_ACCOUNTS.length)];
-}
-
-/**
- * Injecte un tip Jito (SystemProgram.transfer) dans une transaction v0 (base64),
- * retourne un nouveau base64 (non signé) prêt à être signé.
- * Si l’injection échoue, renvoie le base64 original.
- */
-function injectTipBase64(base64Tx) {
-  if (!shouldTip()) return base64Tx;
-
-  try {
-    const tipStr = pickTipAccount();
-    if (!tipStr) return base64Tx;
-
-    const tipPk = new PublicKey(tipStr);
-    const buf = Buffer.from(base64Tx, 'base64');
-    const vtx = VersionedTransaction.deserialize(buf);
-
-    const decompiled = TransactionMessage.decompile(vtx.message);
-    decompiled.instructions.push(
-      SystemProgram.transfer({
-        fromPubkey: wallet.publicKey,
-        toPubkey: tipPk,
-        lamports: CFG.TIP_LAMPORTS,
-      })
-    );
-
-    const newMsg = decompiled.compileToV0Message();
-    const newVtx = new VersionedTransaction(newMsg);
-    const out = Buffer.from(newVtx.serialize()).toString('base64');
-    info(`[tip] Injecté ${CFG.TIP_LAMPORTS} lamports -> ${tipPk.toBase58()}`);
-    return out;
-  } catch (e) {
-    warn('Tip injection failed, sending without tip:', e.message);
-    return base64Tx;
-  }
-}
 
 // -------------------- Helpers Jupiter --------------------
 async function jupQuote({ inputMint, outputMint, amountLamports, slippageBps }) {
@@ -195,15 +153,18 @@ async function pumpBuildSwapTxBase64({ mint, amountLamports, slippageBps }) {
     userPublicKey: WALLET_PK,
     fromMint: CFG.BASE_SOL_MINT,
     toMint: mint,
-    amount: amountLamports,       // SOL (fromMint) en lamports
+    amount: amountLamports,       // SOL en lamports
     slippageBps,
     priorityFeeLamports: priority,
     txVersion: 2,
     wrapSol: true,
   };
+  const headers = { 'Content-Type':'application/json' };
+  if (CFG.PUMP_API_KEY) headers['Authorization'] = `Bearer ${CFG.PUMP_API_KEY}`;
+
   const res = await fetch(CFG.PUMP_PORTAL_URL, {
     method: 'POST',
-    headers: { 'Content-Type':'application/json' },
+    headers,
     body: JSON.stringify(body),
   });
   if (!res.ok) {
@@ -218,16 +179,11 @@ async function pumpBuildSwapTxBase64({ mint, amountLamports, slippageBps }) {
 
 // -------------------- Sender --------------------
 async function signAndSendViaHelius(base64Tx) {
-  // Inject tip avant signature (si activé)
-  const withTip = injectTipBase64(base64Tx);
-
-  // Signe
-  const buf = Buffer.from(withTip, 'base64');
+  const buf = Buffer.from(base64Tx, 'base64');
   const vtx = VersionedTransaction.deserialize(buf);
   vtx.sign([wallet]);
   const raw = Buffer.from(vtx.serialize()).toString('base64');
 
-  // Envoie
   const res = await fetch(CFG.HELIUS_SENDER_URL, {
     method: 'POST',
     headers: { 'Content-Type':'application/json' },
@@ -241,6 +197,55 @@ async function signAndSendViaHelius(base64Tx) {
   const data = await res.json();
   if (!data?.result) throw new Error(`Helius sender error: ${JSON.stringify(data)}`);
   return data.result;
+}
+
+// -------------------- Tip helper (envoie un micro transfert séparé) --------------------
+function pickTipAccount(seed) {
+  if (!CFG.TIP_ACCOUNTS.length) return null;
+  // simple hash pour choisir un compte de tip de manière déterministe
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+  return CFG.TIP_ACCOUNTS[h % CFG.TIP_ACCOUNTS.length];
+}
+async function sendTipIfEnabled(seed) {
+  if (!CFG.INCLUDE_TIP) return;
+  const to = pickTipAccount(seed);
+  if (!to) return;
+
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('processed');
+  const ix = SystemProgram.transfer({
+    fromPubkey: wallet.publicKey,
+    toPubkey: new PublicKey(to),
+    lamports: Math.max(0, CFG.TIP_LAMPORTS),
+  });
+
+  const msg = new TransactionMessage({
+    payerKey: wallet.publicKey,
+    recentBlockhash: blockhash,
+    instructions: [ix],
+  }).compileToV0Message();
+
+  const vtx = new VersionedTransaction(msg);
+  vtx.sign([wallet]);
+  const raw = Buffer.from(vtx.serialize()).toString('base64');
+
+  try {
+    const res = await fetch(CFG.HELIUS_SENDER_URL, {
+      method: 'POST',
+      headers: { 'Content-Type':'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'helius-tip',
+        method: 'sendTransaction',
+        params: [raw, { encoding: 'base64', preflightCommitment: 'processed' }],
+      }),
+    });
+    const j = await res.json();
+    if (!j?.result) throw new Error(JSON.stringify(j));
+    dbg(`💁 Tip sent -> ${j.result} (to=${to})`);
+  } catch (e) {
+    warn('tip send failed:', e.message);
+  }
 }
 
 // -------------------- Price probe (TP/SL/trail) --------------------
@@ -349,19 +354,20 @@ async function buildAndSendBuyTx({ mint, preferPump }) {
   const lamports = Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL);
   const bps = Math.floor(CFG.MAX_SLIPPAGE * 10000);
 
-  // 1) Pump Portal d’abord si preferPump
+  // 1) Pump Portal d'abord si preferPump
   if (preferPump) {
     try {
       const b64 = await pumpBuildSwapTxBase64({ mint, amountLamports: lamports, slippageBps: bps });
+      // Envoie un tip séparé si configuré (avant la tx principale)
+      await sendTipIfEnabled(mint).catch(()=>{});
       const sig = await signAndSendViaHelius(b64);
       return { sig, via: 'pump', priceGuess: null };
     } catch (e) {
       dbg('pump-portal failed -> fallback to Jupiter:', e.message);
-      // continue vers Jupiter
     }
   }
 
-  // 2) Jupiter (quelques réessais agressifs)
+  // 2) Jupiter
   let quote;
   for (let i=0; i<14; i++) {
     try { quote = await jupQuote({ inputMint: CFG.BASE_SOL_MINT, outputMint: mint, amountLamports: lamports, slippageBps: bps }); break; }
@@ -373,6 +379,8 @@ async function buildAndSendBuyTx({ mint, preferPump }) {
     quoteResponse: quote,
     prioritizationFeeLamports: Math.floor(CFG.PRIORITY_FEE_SOL * LAMPORTS_PER_SOL),
   });
+
+  await sendTipIfEnabled(mint).catch(()=>{});
   const sig = await signAndSendViaHelius(swapB64);
   const px = priceFromQuote(quote);
   return { sig, via: 'jupiter', priceGuess: px };
@@ -521,7 +529,8 @@ app.get('/health', (_req, res) => res.send({
   wallet: WALLET_PK,
   triggerMinSol: CFG.TRIGGER_MIN_SOL,
   amm: { strict: CFG.AMM_STRICT, allow: CFG.AMM_PROGRAM_IDS },
-  tip: { include: CFG.INCLUDE_TIP, lamports: CFG.TIP_LAMPORTS, accounts: CFG.TIP_ACCOUNTS.length },
+  tip: { enabled: CFG.INCLUDE_TIP, lamports: CFG.TIP_LAMPORTS, accounts: CFG.TIP_ACCOUNTS.length },
+  pumpApiKey: Boolean(CFG.PUMP_API_KEY),
 }));
 
 app.listen(CFG.PORT, () => {
