@@ -1,6 +1,6 @@
 /**
- * Webhook Helius -> Achat live ultra-rapide (Jupiter + Helius Sender) -> TP/SL/Trailing
- * Logs VIVANTS pour comprendre chaque "skip".
+ * Webhook Helius -> Achat live ultra-rapide (Pump Portal d'abord si PUMP_AMM, sinon Jupiter) -> TP/SL/Trailing
+ * + Injection de TIP Jito (require: INCLUDE_TIP, TIP_LAMPORTS >= 1_000_000, TIP_ACCOUNTS) pour Helius Sender.
  */
 
 import 'dotenv/config';
@@ -11,15 +11,17 @@ import fs from 'fs';
 import bs58 from 'bs58';
 import {
   Connection,
-  PublicKey,
   LAMPORTS_PER_SOL,
   VersionedTransaction,
   Keypair,
+  PublicKey,
+  SystemProgram,
+  TransactionMessage,
 } from '@solana/web3.js';
 
 // -------------------- Config --------------------
 const CFG = {
-  MODE: (process.env.MODE || 'live').toLowerCase(), // live only
+  MODE: (process.env.MODE || 'live').toLowerCase(),
   PORT: Number(process.env.PORT || 10000),
   RPC_URL: process.env.RPC_URL || 'https://api.mainnet-beta.solana.com',
   BASE_SOL_MINT: process.env.BASE_SOL_MINT || 'So11111111111111111111111111111111111111112',
@@ -27,20 +29,24 @@ const CFG = {
   TRIGGER_MIN_SOL: Number(process.env.TRIGGER_MIN_SOL || 200),
 
   TRADE_SIZE_SOL: Number(process.env.TRADE_SIZE_SOL || 0.15),
-  MAX_SLIPPAGE: Number(process.env.MAX_SLIPPAGE || 0.30), // 30%
+  MAX_SLIPPAGE: Number(process.env.MAX_SLIPPAGE || 0.30),
   PRIORITY_FEE_SOL: Number(process.env.PRIORITY_FEE_SOL || 0.008),
 
-  TP1_PCT: Number(process.env.TP1_PCT || 0.40),  // +40%
-  TP1_SELL: Number(process.env.TP1_SELL || 0.70),// 70% sortis
-  TRAIL_GAP: Number(process.env.TRAIL_GAP || 0.15), // 15%
-  HARD_SL: Number(process.env.HARD_SL || 0.35),     // -35%
-  EXIT_TIMEOUT_MS: Number(process.env.EXIT_TIMEOUT_MS || 15000), // 0 = off
+  TP1_PCT: Number(process.env.TP1_PCT || 0.40),
+  TP1_SELL: Number(process.env.TP1_SELL || 0.70),
+  TRAIL_GAP: Number(process.env.TRAIL_GAP || 0.15),
+  HARD_SL: Number(process.env.HARD_SL || 0.35),
+  EXIT_TIMEOUT_MS: Number(process.env.EXIT_TIMEOUT_MS || 15000),
 
   // Jupiter
   JUP_Q_URL: process.env.JUPITER_QUOTE_URL || 'https://quote-api.jup.ag/v6/quote',
   JUP_S_URL: process.env.JUPITER_SWAP_URL || 'https://quote-api.jup.ag/v6/swap',
 
-  // Helius Sender (fast relay)
+  // Pump Portal (pumpswap) – utilisé quand source=PUMP_AMM ou pAMM détecté
+  PUMP_PORTAL_URL: process.env.PUMP_PORTAL_URL || 'https://pumpportal.fun/api/trade',
+  PUMP_PRIORITY_FEE_LAMPORTS: Number(process.env.PUMP_PRIORITY_FEE_LAMPORTS || 0), // 0 => on utilise PRIORITY_FEE_SOL
+
+  // Helius Sender (relay ultra-rapide)
   HELIUS_SENDER_URL: process.env.HELIUS_SENDER_URL || '',
 
   // AMM allowlist
@@ -50,36 +56,35 @@ const CFG = {
     .filter(Boolean),
   AMM_STRICT: ['1','true','yes'].includes(String(process.env.AMM_STRICT || '').toLowerCase()),
 
-  // Wallet
-  WALLET_SECRET_KEY: process.env.WALLET_SECRET_KEY || '', // base58
+  // ---- Tip Jito (Helius Sender) ----
+  INCLUDE_TIP: ['1','true','yes'].includes(String(process.env.INCLUDE_TIP || '0').toLowerCase()),
+  TIP_LAMPORTS: Number(process.env.TIP_LAMPORTS || 0), // ex: 1_000_000 = 0.001 SOL
+  TIP_ACCOUNTS: (process.env.TIP_ACCOUNTS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean),
 
+  WALLET_SECRET_KEY: process.env.WALLET_SECRET_KEY || '', // base58
   CSV_FILE: process.env.CSV_FILE || 'live_trades.csv',
   LOG_LEVEL: (process.env.LOG_LEVEL || 'info').toLowerCase(),
 };
+
+// pAMM connu
+const PUMP_AMM_PROGRAM = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA';
 
 const dbg  = (...a) => { if (CFG.LOG_LEVEL === 'debug') console.log(...a); };
 const info = (...a) => console.log(...a);
 const warn = (...a) => console.warn(...a);
 const err  = (...a) => console.error(...a);
 
-// Safety checks
-if (!CFG.WALLET_SECRET_KEY) {
-  err('❌ WALLET_SECRET_KEY manquant (base58).');
-  process.exit(1);
-}
-if (!CFG.HELIUS_SENDER_URL) {
-  err('❌ HELIUS_SENDER_URL manquant.');
-  process.exit(1);
-}
+// Safety
+if (!CFG.WALLET_SECRET_KEY) { err('❌ WALLET_SECRET_KEY manquant'); process.exit(1); }
+if (!CFG.HELIUS_SENDER_URL) { err('❌ HELIUS_SENDER_URL manquant'); process.exit(1); }
 
 // -------------------- Setup --------------------
 const connection = new Connection(CFG.RPC_URL, { commitment: 'processed' });
 const wallet = Keypair.fromSecretKey(bs58.decode(CFG.WALLET_SECRET_KEY));
 const WALLET_PK = wallet.publicKey.toBase58();
-
-info(`▶️  Mode=${CFG.MODE}  LOG_LEVEL=${CFG.LOG_LEVEL}`);
-info(`▶️  AMM_STRICT=${CFG.AMM_STRICT}  AMM_PROGRAM_IDS=[${CFG.AMM_PROGRAM_IDS.join(',')}]`);
-info(`▶️  trigger>=${CFG.TRIGGER_MIN_SOL} SOL | trade=${CFG.TRADE_SIZE_SOL} SOL | fee=${CFG.PRIORITY_FEE_SOL} SOL`);
 
 if (!fs.existsSync(CFG.CSV_FILE)) {
   fs.writeFileSync(CFG.CSV_FILE, 'time,event,side,price,sol,token,extra\n');
@@ -92,7 +97,52 @@ function csv(row) {
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fmt = (n) => Number(n).toFixed(6);
 
-// -------------------- Jupiter helpers --------------------
+// -------------------- Tip helpers --------------------
+function shouldTip() {
+  return CFG.INCLUDE_TIP && CFG.TIP_LAMPORTS >= 1_000_000 && CFG.TIP_ACCOUNTS.length > 0;
+}
+function pickTipAccount() {
+  if (!CFG.TIP_ACCOUNTS.length) return null;
+  return CFG.TIP_ACCOUNTS[Math.floor(Math.random() * CFG.TIP_ACCOUNTS.length)];
+}
+
+/**
+ * Injecte un tip Jito (SystemProgram.transfer) dans une transaction v0 (base64),
+ * retourne un nouveau base64 (non signé) prêt à être signé.
+ * Si l’injection échoue, renvoie le base64 original.
+ */
+function injectTipBase64(base64Tx) {
+  if (!shouldTip()) return base64Tx;
+
+  try {
+    const tipStr = pickTipAccount();
+    if (!tipStr) return base64Tx;
+
+    const tipPk = new PublicKey(tipStr);
+    const buf = Buffer.from(base64Tx, 'base64');
+    const vtx = VersionedTransaction.deserialize(buf);
+
+    const decompiled = TransactionMessage.decompile(vtx.message);
+    decompiled.instructions.push(
+      SystemProgram.transfer({
+        fromPubkey: wallet.publicKey,
+        toPubkey: tipPk,
+        lamports: CFG.TIP_LAMPORTS,
+      })
+    );
+
+    const newMsg = decompiled.compileToV0Message();
+    const newVtx = new VersionedTransaction(newMsg);
+    const out = Buffer.from(newVtx.serialize()).toString('base64');
+    info(`[tip] Injecté ${CFG.TIP_LAMPORTS} lamports -> ${tipPk.toBase58()}`);
+    return out;
+  } catch (e) {
+    warn('Tip injection failed, sending without tip:', e.message);
+    return base64Tx;
+  }
+}
+
+// -------------------- Helpers Jupiter --------------------
 async function jupQuote({ inputMint, outputMint, amountLamports, slippageBps }) {
   const url = new URL(CFG.JUP_Q_URL);
   url.searchParams.set('inputMint', inputMint);
@@ -108,7 +158,6 @@ async function jupQuote({ inputMint, outputMint, amountLamports, slippageBps }) 
   if (!data?.data?.length) throw new Error('No route');
   return data;
 }
-
 function priceFromQuote(q) {
   const r = q?.data?.[0];
   if (!r) return null;
@@ -116,7 +165,6 @@ function priceFromQuote(q) {
   const outAmt = Number(r.outAmount) / (10 ** (r.outAmountDecimals ?? 9));
   return inAmt / outAmt;
 }
-
 async function jupBuildSwapTxBase64({ quoteResponse, prioritizationFeeLamports }) {
   const body = {
     quoteResponse,
@@ -124,7 +172,6 @@ async function jupBuildSwapTxBase64({ quoteResponse, prioritizationFeeLamports }
     wrapAndUnwrapSOL: true,
     restrictIntermediateTokens: false,
     dynamicComputeUnitLimit: true,
-    // priorité réseau
     prioritizationFeeLamports: Math.max(0, Math.floor(prioritizationFeeLamports || 0)),
   };
   const res = await fetch(CFG.JUP_S_URL, {
@@ -138,17 +185,49 @@ async function jupBuildSwapTxBase64({ quoteResponse, prioritizationFeeLamports }
   }
   const data = await res.json();
   if (!data?.swapTransaction) throw new Error('no swapTransaction');
-  return data.swapTransaction; // base64
+  return data.swapTransaction;
 }
 
+// -------------------- Helper Pump Portal (pumpswap) --------------------
+async function pumpBuildSwapTxBase64({ mint, amountLamports, slippageBps }) {
+  const priority = CFG.PUMP_PRIORITY_FEE_LAMPORTS || Math.floor(CFG.PRIORITY_FEE_SOL * LAMPORTS_PER_SOL);
+  const body = {
+    userPublicKey: WALLET_PK,
+    fromMint: CFG.BASE_SOL_MINT,
+    toMint: mint,
+    amount: amountLamports,       // SOL (fromMint) en lamports
+    slippageBps,
+    priorityFeeLamports: priority,
+    txVersion: 2,
+    wrapSol: true,
+  };
+  const res = await fetch(CFG.PUMP_PORTAL_URL, {
+    method: 'POST',
+    headers: { 'Content-Type':'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`pump portal ${res.status}: ${t}`);
+  }
+  const data = await res.json();
+  const b64 = data?.swapTransaction || data?.transaction || data?.tx || null;
+  if (!b64) throw new Error('pump portal: no transaction in response');
+  return b64;
+}
+
+// -------------------- Sender --------------------
 async function signAndSendViaHelius(base64Tx) {
-  // Désérialise & signe
-  const buf = Buffer.from(base64Tx, 'base64');
+  // Inject tip avant signature (si activé)
+  const withTip = injectTipBase64(base64Tx);
+
+  // Signe
+  const buf = Buffer.from(withTip, 'base64');
   const vtx = VersionedTransaction.deserialize(buf);
   vtx.sign([wallet]);
   const raw = Buffer.from(vtx.serialize()).toString('base64');
 
-  // Envoi Helius Sender
+  // Envoie
   const res = await fetch(CFG.HELIUS_SENDER_URL, {
     method: 'POST',
     headers: { 'Content-Type':'application/json' },
@@ -160,13 +239,11 @@ async function signAndSendViaHelius(base64Tx) {
     }),
   });
   const data = await res.json();
-  if (!data?.result) {
-    throw new Error(`Helius sender error: ${JSON.stringify(data)}`);
-  }
-  return data.result; // signature
+  if (!data?.result) throw new Error(`Helius sender error: ${JSON.stringify(data)}`);
+  return data.result;
 }
 
-// -------------------- Price polling (pour TP/SL/Trailing) --------------------
+// -------------------- Price probe (TP/SL/trail) --------------------
 async function spotPriceFast(mint, { attempts = 12 } = {}) {
   const lamports = Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL);
   const bps = Math.floor(CFG.MAX_SLIPPAGE * 10000);
@@ -181,17 +258,16 @@ async function spotPriceFast(mint, { attempts = 12 } = {}) {
       const px = priceFromQuote(q);
       if (px) return px;
     } catch {}
-    await sleep(120); // agressif
+    await sleep(120);
   }
   return null;
 }
 
-// -------------------- AMM filter & extract helpers --------------------
+// -------------------- AMM filter & extraction --------------------
 function collectPrograms(payload) {
   const keys = payload?.transaction?.message?.accountKeys || [];
   const seen = new Set();
   if (payload?.programId) seen.add(String(payload.programId));
-
   for (const ins of (payload?.transaction?.message?.instructions || [])) {
     if (ins.programId) seen.add(String(ins.programId));
     if (ins.programIdIndex !== undefined && keys[ins.programIdIndex]) {
@@ -208,26 +284,20 @@ function collectPrograms(payload) {
   }
   return [...seen];
 }
-
 function ammAllowed(payload) {
-  if (!CFG.AMM_PROGRAM_IDS.length) {
-    dbg('amm: allowlist empty -> pass');
-    return true;
-  }
+  if (!CFG.AMM_PROGRAM_IDS.length) { dbg('amm: allowlist empty -> pass'); return true; }
   const seen = collectPrograms(payload);
   dbg('[amm] seen programs =>', JSON.stringify(seen));
   const allow = new Set(CFG.AMM_PROGRAM_IDS);
   const any = seen.some(p => allow.has(p));
   if (CFG.AMM_STRICT) {
-    if (!any) dbg('skip: amm-filter-skip (STRICT; no match with allowlist)');
+    if (!any) dbg('skip: amm-filter-skip (STRICT; no match)');
     return any;
   } else {
     if (!any) dbg('amm filter: fallback by type (non-strict)');
-    return true; // non-strict -> on laisse passer
+    return true;
   }
 }
-
-// mint candidat: celui le plus crédité côté pool
 function extractMint(payload) {
   const acc = payload?.accountData || [];
   const deltas = new Map();
@@ -240,7 +310,6 @@ function extractMint(payload) {
   }
   if (deltas.size) return [...deltas.entries()].sort((a,b)=>b[1]-a[1])[0][0];
 
-  // fallback legacy
   const pre = payload?.meta?.preTokenBalances || [];
   const post = payload?.meta?.postTokenBalances || [];
   const byMint = {};
@@ -255,7 +324,6 @@ function extractMint(payload) {
   const cand = Object.entries(byMint).sort((a,b)=>b[1]-a[1]);
   return cand.length ? cand[0][0] : null;
 }
-
 function estimateSolAdded(payload) {
   const solMint = CFG.BASE_SOL_MINT;
   const t = payload?.tokenTransfers || [];
@@ -272,22 +340,32 @@ function estimateSolAdded(payload) {
   return lamports / LAMPORTS_PER_SOL;
 }
 
-// -------------------- LIVE trading core --------------------
-let position = null; // { mint, entry, sizeToken, high, remainingPct, startedAt }
+// -------------------- Trading core --------------------
+let position = null; // { mint, entry, sizeToken, high, remainingPct }
 
 function trailStopPrice(p) { return p.high * (1 - CFG.TRAIL_GAP); }
 
-async function liveBuy(mint) {
+async function buildAndSendBuyTx({ mint, preferPump }) {
   const lamports = Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL);
   const bps = Math.floor(CFG.MAX_SLIPPAGE * 10000);
 
-  // Quote avec réessais agressifs (route pas toujours dispo aux tous premiers slots)
+  // 1) Pump Portal d’abord si preferPump
+  if (preferPump) {
+    try {
+      const b64 = await pumpBuildSwapTxBase64({ mint, amountLamports: lamports, slippageBps: bps });
+      const sig = await signAndSendViaHelius(b64);
+      return { sig, via: 'pump', priceGuess: null };
+    } catch (e) {
+      dbg('pump-portal failed -> fallback to Jupiter:', e.message);
+      // continue vers Jupiter
+    }
+  }
+
+  // 2) Jupiter (quelques réessais agressifs)
   let quote;
   for (let i=0; i<14; i++) {
-    try {
-      quote = await jupQuote({ inputMint: CFG.BASE_SOL_MINT, outputMint: mint, amountLamports: lamports, slippageBps: bps });
-      break;
-    } catch (e) { await sleep(90); }
+    try { quote = await jupQuote({ inputMint: CFG.BASE_SOL_MINT, outputMint: mint, amountLamports: lamports, slippageBps: bps }); break; }
+    catch { await sleep(90); }
   }
   if (!quote) throw new Error('No route from Jupiter (buy)');
 
@@ -296,16 +374,19 @@ async function liveBuy(mint) {
     prioritizationFeeLamports: Math.floor(CFG.PRIORITY_FEE_SOL * LAMPORTS_PER_SOL),
   });
   const sig = await signAndSendViaHelius(swapB64);
-  info(`🟢 [ENTER TX SENT] ${sig}`);
+  const px = priceFromQuote(quote);
+  return { sig, via: 'jupiter', priceGuess: px };
+}
 
-  // Estimation de fill (prudente)
-  const px = priceFromQuote(quote) || 0.000001;
-  const fill = px * (1 + 0.5 * CFG.MAX_SLIPPAGE);
-  const sizeToken = CFG.TRADE_SIZE_SOL / fill;
+async function liveBuy(mint, preferPump) {
+  const { sig, via, priceGuess } = await buildAndSendBuyTx({ mint, preferPump });
 
-  position = { mint, entry: fill, sizeToken, high: fill, remainingPct: 1.0, startedAt: Date.now() };
-  info(`🟢 [ENTER] ${mint} @ ${fmt(fill)} SOL/token | size=${fmt(sizeToken)} tok`);
-  csv({ event:'enter', side:'BUY', price:fill, sol:CFG.TRADE_SIZE_SOL, token:sizeToken, extra:`sig=${sig}` });
+  const px = (priceGuess || 0.000001) * (1 + 0.5 * CFG.MAX_SLIPPAGE);
+  const sizeToken = CFG.TRADE_SIZE_SOL / px;
+
+  position = { mint, entry: px, sizeToken, high: px, remainingPct: 1.0 };
+  info(`🟢 [ENTER TX SENT/${via}] ${sig} | fill~ ${fmt(px)} SOL/tok | size=${fmt(sizeToken)} tok`);
+  csv({ event:'enter', side:'BUY', price:px, sol:CFG.TRADE_SIZE_SOL, token:sizeToken, extra:`sig=${sig}|via=${via}` });
 }
 
 async function liveSellPct(pct) {
@@ -313,14 +394,13 @@ async function liveSellPct(pct) {
   const sellTokenMint = position.mint;
   const sellSize = position.sizeToken * pct;
 
-  // Récup décimales (via probe rapide)
+  // Décimales token via probe Jupiter
   const probe = await jupQuote({
     inputMint: CFG.BASE_SOL_MINT,
     outputMint: sellTokenMint,
     amountLamports: Math.floor(0.01 * LAMPORTS_PER_SOL),
     slippageBps: Math.floor(CFG.MAX_SLIPPAGE * 10000),
   }).catch(() => null);
-
   let tokenDecimals = probe?.data?.[0]?.outAmountDecimals ?? 9;
   const tokenUnits = Math.max(1, Math.floor(sellSize * (10 ** tokenDecimals)));
 
@@ -372,28 +452,20 @@ async function managePositionLoop() {
 
 // -------------------- Webhook --------------------
 const app = express();
-
-// body logs: size + batch length
 app.use(bodyParser.json({ limit: '20mb' }));
 app.use((err, req, res, next) => {
-  if (err?.type === 'entity.too.large') {
-    err('Body too large:', err.message);
-    return res.status(413).send('Body too large');
-  }
+  if (err?.type === 'entity.too.large') { err('Body too large:', err.message); return res.status(413).send('Body too large'); }
   next(err);
 });
-app.use((req, _res, next) => {
-  if (req.path === '/helius-webhook') {
-    const rawLen = Number(req.headers['content-length'] || 0);
-    dbg(`[hit] ${req.path} bodySize=${rawLen}B`);
-    if (Array.isArray(req.body)) dbg('[hit] batchLen=', req.body.length);
-    else if (req.body) dbg('[hit] batchLen= 1');
-  }
-  next();
-});
+app.use((req,_res,next)=>{ if(req.path==='/helius-webhook'){ const l=Number(req.headers['content-length']||0); dbg(`[hit] ${req.path} bodySize=${l}B`); if(Array.isArray(req.body)) dbg('[hit] batchLen=', req.body.length); else if(req.body) dbg('[hit] batchLen= 1'); } next(); });
 
-// anti double-fire
-const seenMint = new Map(); // mint => ts
+const seenMint = new Map();
+
+function isPumpEvent(payload) {
+  if (payload?.source === 'PUMP_AMM') return true;
+  const progs = collectPrograms(payload);
+  return progs.includes(PUMP_AMM_PROGRAM);
+}
 
 app.post('/helius-webhook', async (req, res) => {
   try {
@@ -411,43 +483,28 @@ app.post('/helius-webhook', async (req, res) => {
     }
 
     const mint = extractMint(payload);
-    if (!mint) {
-      warn('skip: no-mint (no candidate mint found)');
-      return res.status(200).send({ ok:true, note:'no-mint' });
-    }
+    if (!mint) { warn('skip: no-mint'); return res.status(200).send({ ok:true, note:'no-mint' }); }
 
     const added = estimateSolAdded(payload);
     const slot = payload?.slot;
     info(`🚀 Nouveau token détecté: ${mint} | type=${t} source=${src} | ~${fmt(added)} SOL ajoutés`);
     csv({ event:'detect', sol:added, token:mint, extra:`type=${t}|source=${src}|slot=${slot}` });
 
-    // Seuil
-    if (added < CFG.TRIGGER_MIN_SOL) {
-      dbg(`skip: below-threshold (${fmt(added)} < ${CFG.TRIGGER_MIN_SOL})`);
-      return res.status(200).send({ ok:true, note:'below-threshold', added });
-    }
+    if (added < CFG.TRIGGER_MIN_SOL) { dbg(`skip: below-threshold (${fmt(added)} < ${CFG.TRIGGER_MIN_SOL})`); return res.status(200).send({ ok:true, note:'below-threshold', added }); }
 
-    // cooldown
     const now = Date.now();
-    if (seenMint.get(mint) && now - seenMint.get(mint) < 30000) {
-      dbg('skip: cooldown (30s) for mint', mint);
-      return res.status(200).send({ ok:true, note:'cooldown' });
-    }
+    if (seenMint.get(mint) && now - seenMint.get(mint) < 30000) { dbg('skip: cooldown 30s'); return res.status(200).send({ ok:true, note:'cooldown' }); }
     seenMint.set(mint, now);
 
-    // Entrée live
+    const preferPump = isPumpEvent(payload);
+
     try {
-      await liveBuy(mint);
+      await liveBuy(mint, preferPump);
       managePositionLoop().catch(()=>{});
       if (CFG.EXIT_TIMEOUT_MS > 0) {
-        setTimeout(async () => {
-          if (position && position.mint === mint) {
-            info(`⏳ Timeout ${CFG.EXIT_TIMEOUT_MS}ms => sortie totale`);
-            await liveSellPct(1.0);
-          }
-        }, CFG.EXIT_TIMEOUT_MS);
+        setTimeout(async () => { if (position && position.mint === mint) { info(`⏳ Timeout ${CFG.EXIT_TIMEOUT_MS}ms => sortie totale`); await liveSellPct(1.0); } }, CFG.EXIT_TIMEOUT_MS);
       }
-      return res.status(200).send({ ok:true, triggered:true, mint, added });
+      return res.status(200).send({ ok:true, triggered:true, mint, added, preferPump });
     } catch (e) {
       err('Buy failed:', e.message);
       return res.status(200).send({ ok:true, note:'buy-failed', err:e.message });
@@ -464,6 +521,7 @@ app.get('/health', (_req, res) => res.send({
   wallet: WALLET_PK,
   triggerMinSol: CFG.TRIGGER_MIN_SOL,
   amm: { strict: CFG.AMM_STRICT, allow: CFG.AMM_PROGRAM_IDS },
+  tip: { include: CFG.INCLUDE_TIP, lamports: CFG.TIP_LAMPORTS, accounts: CFG.TIP_ACCOUNTS.length },
 }));
 
 app.listen(CFG.PORT, () => {
