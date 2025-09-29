@@ -448,14 +448,14 @@ app.post('/helius-webhook', async (req, res) => {
     // Filtre AMM (si défini)
     if (!txTouchesKnownAMMPrograms(payload)) {
       dbg('AMM filter: skip (no known AMM program / type)');
-      dbg('AMM filter skip → seen:', []);
+      dbg('AMM filter skip → seen:', [payload?.type]);
       return res.status(200).send({ ok: true, note: 'amm-filter-skip' });
     }
 
     // Détection mint & liquidité
     const mint = extractCandidateMintEnhanced(payload);
     if (!mint) {
-      dbg('No candidate mint found');
+      dbg('No candidate mint found (type:', payload?.type, ')');
       return res.status(200).send({ ok: true, note: 'no-mint' });
     }
 
