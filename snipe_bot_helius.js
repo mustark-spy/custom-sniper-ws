@@ -1,8 +1,3 @@
-/**
- * Webhook Helius -> Achat live ultra-rapide (Pump trade-local d'abord si PUMP_AMM, sinon Jupiter)
- * -> TP/SL/Trailing + timeout
- */
-
 import 'dotenv/config';
 import express from 'express';
 import bodyParser from 'body-parser';
@@ -15,8 +10,8 @@ import {
   VersionedTransaction,
   Keypair,
   SystemProgram,
+  PublicKey,
   TransactionMessage,
-  PublicKey
 } from '@solana/web3.js';
 
 // -------------------- Config --------------------
@@ -29,7 +24,7 @@ const CFG = {
   TRIGGER_MIN_SOL: Number(process.env.TRIGGER_MIN_SOL || 200),
 
   TRADE_SIZE_SOL: Number(process.env.TRADE_SIZE_SOL || 0.15),
-  MAX_SLIPPAGE: Number(process.env.MAX_SLIPPAGE || 0.30),   // ex: 0.30 => 30%
+  MAX_SLIPPAGE: Number(process.env.MAX_SLIPPAGE || 0.30),
   PRIORITY_FEE_SOL: Number(process.env.PRIORITY_FEE_SOL || 0.008),
 
   TP1_PCT: Number(process.env.TP1_PCT || 0.40),
@@ -40,23 +35,26 @@ const CFG = {
 
   // Jupiter
   JUP_Q_URL: process.env.JUPITER_QUOTE_URL || 'https://quote-api.jup.ag/v6/quote',
-  JUP_S_URL: process.env.JUPITER_SWAP_URL || 'https://quote-api.jup.ag/v6/swap',
+  JUP_SWAP_TX_URL: process.env.JUPITER_SWAP_URL || 'https://quote-api.jup.ag/v6/swap', // si besoin
+  JUP_SWAP_INS_URL: process.env.JUPITER_SWAP_INS_URL || 'https://quote-api.jup.ag/v6/swap-instructions',
 
-  // Pump Portal (sans API key)
-  PUMP_TRADE_LOCAL_URL: 'https://pumpportal.fun/api/trade-local',
+  // Pump Portal
+  PUMP_TRADE_LOCAL_URL: process.env.PUMP_TRADE_LOCAL_URL || 'https://pumpportal.fun/api/trade-local',
 
-  // Helius Sender (relay ultra-rapide)
+  // Helius Sender (FAST)
   HELIUS_SENDER_URL: process.env.HELIUS_SENDER_URL || '',
 
   // AMM allowlist
   AMM_PROGRAM_IDS: (process.env.AMM_PROGRAM_IDS || '')
-    .split(',').map(s => s.trim()).filter(Boolean),
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean),
   AMM_STRICT: ['1','true','yes'].includes(String(process.env.AMM_STRICT || '').toLowerCase()),
 
-  // Tipping Helius (recommandé)
+  // TIP (OBLIGATOIRE pour /fast -> doit être dans la même TX !)
   INCLUDE_TIP: ['1','true','yes'].includes(String(process.env.INCLUDE_TIP || '').toLowerCase()),
-  TIP_LAMPORTS: Number(process.env.TIP_LAMPORTS || 1_000_000), // 0.001 SOL par défaut
-  TIP_ACCOUNTS: (process.env.TIP_ACCOUNTS || '').split(',').map(s=>s.trim()).filter(Boolean),
+  TIP_LAMPORTS: Number(process.env.TIP_LAMPORTS || 1000000), // >= 0.001 SOL
+  TIP_ACCOUNTS: (process.env.TIP_ACCOUNTS || '').split(',').map(s => s.trim()).filter(Boolean),
 
   WALLET_SECRET_KEY: process.env.WALLET_SECRET_KEY || '', // base58
   CSV_FILE: process.env.CSV_FILE || 'live_trades.csv',
@@ -70,22 +68,24 @@ const info = (...a) => console.log(...a);
 const warn = (...a) => console.warn(...a);
 const err  = (...a) => console.error(...a);
 
-// Safety
 if (!CFG.WALLET_SECRET_KEY) { err('❌ WALLET_SECRET_KEY manquant'); process.exit(1); }
 if (!CFG.HELIUS_SENDER_URL) { err('❌ HELIUS_SENDER_URL manquant'); process.exit(1); }
+// tip sanity for /fast
+if (CFG.INCLUDE_TIP) {
+  if (!CFG.TIP_ACCOUNTS.length) { err('❌ INCLUDE_TIP=1 mais TIP_ACCOUNTS vide'); process.exit(1); }
+  if (CFG.TIP_LAMPORTS < 1_000_000) { err('❌ TIP_LAMPORTS doit être >= 1_000_000 (0.001 SOL)'); process.exit(1); }
+}
 
 // -------------------- Setup --------------------
 const connection = new Connection(CFG.RPC_URL, { commitment: 'processed' });
 const wallet = Keypair.fromSecretKey(bs58.decode(CFG.WALLET_SECRET_KEY));
 const WALLET_PK = wallet.publicKey.toBase58();
 
-if (!fs.existsSync(CFG.CSV_FILE)) {
-  fs.writeFileSync(CFG.CSV_FILE, 'time,event,side,price,sol,token,extra\n');
-}
-function csv(row) {
+if (!fs.existsSync(CFG.CSV_FILE)) fs.writeFileSync(CFG.CSV_FILE, 'time,event,side,price,sol,token,extra\n');
+const csv = (row) => {
   const line = `${new Date().toISOString()},${row.event},${row.side||''},${row.price||''},${row.sol||''},${row.token||''},${row.extra||''}\n`;
   fs.appendFileSync(CFG.CSV_FILE, line);
-}
+};
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fmt = (n) => Number(n).toFixed(6);
@@ -113,70 +113,98 @@ function priceFromQuote(q) {
   const outAmt = Number(r.outAmount) / (10 ** (r.outAmountDecimals ?? 9));
   return inAmt / outAmt;
 }
-async function jupBuildSwapTxBase64({ quoteResponse, prioritizationFeeLamports }) {
+
+// Build V0 tx with Jupiter swap-instructions + TIP instruction (same tx !)
+async function jupBuildSwapV0WithTip({ quoteResponse, tipLamports, tipAccount }) {
+  // 1) Fetch jupiter swap-instructions
+  const insRes = await fetch(CFG.JUP_SWAP_INS_URL, {
+    method: 'POST',
+    headers: { 'Content-Type':'application/json' },
+    body: JSON.stringify({
+      quoteResponse,
+      userPublicKey: WALLET_PK,
+      wrapAndUnwrapSOL: true,
+      dynamicComputeUnitLimit: true,
+      asLegacyTransaction: false,
+    }),
+  });
+  if (!insRes.ok) {
+    const t = await insRes.text();
+    throw new Error(`swap-instructions ${insRes.status}: ${t}`);
+  }
+  const insData = await insRes.json();
+  const { setupInstructions = [], swapInstruction, cleanupInstruction, addressLookupTables = [] } = insData || {};
+  if (!swapInstruction) throw new Error('swap-instructions: missing swapInstruction');
+
+  // 2) Résoudre les ALT pour composer le message v0
+  // Jupiter renvoie addressLookupTables (addresses). On doit fetcher les comptes ALT depuis RPC.
+  const altAccounts = [];
+  for (const addr of addressLookupTables) {
+    const pub = new PublicKey(addr);
+    const { value } = await connection.getAddressLookupTable(pub);
+    if (!value) throw new Error(`ALT not found on-chain: ${addr}`);
+    altAccounts.push(value);
+  }
+
+  // 3) Construire la liste des instructions TransactionInstruction
+  const ix = [];
+  for (const i of setupInstructions) ix.push(i);
+  ix.push(swapInstruction);
+  if (cleanupInstruction) ix.push(cleanupInstruction);
+
+  // 4) Ajouter l’instruction TIP *dans la même TX*
+  if (CFG.INCLUDE_TIP && tipLamports > 0 && tipAccount) {
+    ix.push(SystemProgram.transfer({
+      fromPubkey: wallet.publicKey,
+      toPubkey: new PublicKey(tipAccount),
+      lamports: tipLamports,
+    }));
+  }
+
+  // 5) Assemble + sign
+  const { blockhash } = await connection.getLatestBlockhash('processed');
+  const msg = new TransactionMessage({
+    payerKey: wallet.publicKey,
+    recentBlockhash: blockhash,
+    instructions: ix,
+  }).compileToV0Message(altAccounts);
+
+  const vtx = new VersionedTransaction(msg);
+  vtx.sign([wallet]);
+  return vtx; // VersionedTransaction signé (tip inclus)
+}
+
+// -------------------- Pump trade-local (tentative) --------------------
+async function pumpTradeLocalBuildTx({ mint, solAmount, slippagePct }) {
   const body = {
-    quoteResponse,
-    userPublicKey: WALLET_PK,
-    wrapAndUnwrapSOL: true,
-    restrictIntermediateTokens: false,
-    dynamicComputeUnitLimit: true,
-    prioritizationFeeLamports: Math.max(0, Math.floor(prioritizationFeeLamports || 0)),
+    publicKey: WALLET_PK,
+    action: 'buy',
+    mint,
+    denominatedInSol: 'true',
+    amount: solAmount,                 // en SOL
+    slippage: Math.round(slippagePct * 100),  // 0.30 -> 30
+    priorityFee: Number(CFG.PRIORITY_FEE_SOL || 0),
+    pool: 'auto', // 'pump'|'pump-amm'|'auto'
   };
-  const res = await fetch(CFG.JUP_S_URL, {
+  const res = await fetch(CFG.PUMP_TRADE_LOCAL_URL, {
     method: 'POST',
     headers: { 'Content-Type':'application/json' },
     body: JSON.stringify(body),
   });
   if (!res.ok) {
     const t = await res.text();
-    throw new Error(`swap build ${res.status}: ${t}`);
+    throw new Error(`pump trade-local ${res.status}: ${t}`);
   }
-  const data = await res.json();
-  const b64 = data?.swapTransaction;
-  if (!b64) throw new Error('no swapTransaction');
-  return b64;
+  // Renvoie un binaire (arrayBuffer) représentant la tx v0
+  const buf = new Uint8Array(await res.arrayBuffer());
+  const vtx = VersionedTransaction.deserialize(buf);
+  return vtx;
 }
 
-// -------------------- Pump trade-local --------------------
-async function pumpTradeLocalBuildAndSend({ mint }) {
-  // pump trade-local attend:
-  //  - denominatedInSol: "true" | "false" (string !)
-  //  - amount: nombre en SOL si denominatedInSol="true"
-  //  - slippage: pourcentage entier (ex: 10 pour 10%)
-  //  - priorityFee: en SOL
-  const body = {
-    publicKey: WALLET_PK,
-    action: 'buy',
-    mint,
-    denominatedInSol: 'true',
-    amount: Number(CFG.TRADE_SIZE_SOL),
-    slippage: Math.round(CFG.MAX_SLIPPAGE * 100),
-    priorityFee: Number(CFG.PRIORITY_FEE_SOL),
-    pool: 'auto', // 'pump', 'pump-amm', 'auto'... on laisse auto
-  };
-
-  const res = await fetch(CFG.PUMP_TRADE_LOCAL_URL, {
-    method: 'POST',
-    headers: { 'Content-Type':'application/json' },
-    body: JSON.stringify(body),
-  });
-
-  if (res.status !== 200) {
-    const txt = await res.text().catch(()=> '');
-    throw new Error(`pump trade-local ${res.status}: ${txt || res.statusText}`);
-  }
-
-  const ab = await res.arrayBuffer();
-  const tx = VersionedTransaction.deserialize(new Uint8Array(ab));
-  tx.sign([wallet]);
-  const raw = Buffer.from(tx.serialize()).toString('base64');
-
-  const sig = await heliusSendRawBase64(raw);
-  return { sig, via: 'pump-local' };
-}
-
-// -------------------- Helius Sender --------------------
-async function heliusSendRawBase64(base64Tx) {
+// -------------------- Helius Sender (FAST) --------------------
+async function sendViaHeliusFAST(versionedTx) {
+  // /fast n’accepte pas preflight; il veut une tx base64
+  const raw = Buffer.from(versionedTx.serialize()).toString('base64');
   const res = await fetch(CFG.HELIUS_SENDER_URL, {
     method: 'POST',
     headers: { 'Content-Type':'application/json' },
@@ -184,18 +212,17 @@ async function heliusSendRawBase64(base64Tx) {
       jsonrpc: '2.0',
       id: 'helius-snipe',
       method: 'sendTransaction',
-      // IMPORTANT: pas de preflight avec Sender
-      params: [base64Tx, { encoding: 'base64', skipPreflight: true, maxRetries: 0 }],
+      params: [raw, { encoding: 'base64' }],
     }),
   });
   const data = await res.json();
   if (!data?.result) {
     throw new Error(`Helius sender error: ${JSON.stringify(data)}`);
   }
-  return data.result;
+  return data.result; // signature
 }
 
-// -------------------- Prix "rapide" (TP/SL/trailing) --------------------
+// -------------------- Price probe (TP/SL/trail) --------------------
 async function spotPriceFast(mint, { attempts = 12 } = {}) {
   const lamports = Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL);
   const bps = Math.floor(CFG.MAX_SLIPPAGE * 10000);
@@ -292,85 +319,73 @@ function estimateSolAdded(payload) {
   return lamports / LAMPORTS_PER_SOL;
 }
 
-// -------------------- Tipping (simple, transaction séparée) --------------------
-async function sendHeliusTip() {
-  if (!CFG.INCLUDE_TIP) return;
-  const to = CFG.TIP_ACCOUNTS[(Math.random() * CFG.TIP_ACCOUNTS.length) | 0];
-  if (!to) return;
-
-  const ix = SystemProgram.transfer({
-    fromPubkey: wallet.publicKey,
-    toPubkey: new PublicKey(to),
-    lamports: Math.max(1, CFG.TIP_LAMPORTS),
-  });
-
-  const msg = new TransactionMessage({
-    payerKey: wallet.publicKey,
-    recentBlockhash: (await connection.getLatestBlockhash('processed')).blockhash,
-    instructions: [ix],
-  }).compileToV0Message();
-
-  const vtx = new VersionedTransaction(msg);
-  vtx.sign([wallet]);
-  const raw = Buffer.from(vtx.serialize()).toString('base64');
-  try {
-    const sig = await heliusSendRawBase64(raw);
-    info(`[tip] sent ${CFG.TIP_LAMPORTS} lamports to ${to} | ${sig}`);
-  } catch (e) {
-    warn('tip send failed:', e.message);
-  }
-}
-
 // -------------------- Trading core --------------------
 let position = null; // { mint, entry, sizeToken, high, remainingPct }
+
 function trailStopPrice(p) { return p.high * (1 - CFG.TRAIL_GAP); }
 
-async function buildAndSendBuyTx({ mint, preferPump }) {
-  // tip (séparé) juste avant l’envoi pour respecter la doc du Sender
-  await sendHeliusTip();
+// Choisit un tip account pseudo-aléatoire
+function pickTipAccount() {
+  if (!CFG.TIP_ACCOUNTS.length) return null;
+  const i = Math.floor(Math.random() * CFG.TIP_ACCOUNTS.length);
+  return CFG.TIP_ACCOUNTS[i];
+}
 
-  // 1) Pump trade-local en priorité si preferPump
+async function buildAndSendBuyTx_FAST({ mint, preferPump }) {
+  const lamports = Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL);
+  const bps = Math.floor(CFG.MAX_SLIPPAGE * 10000);
+  const tipAcc = CFG.INCLUDE_TIP ? pickTipAccount() : null;
+
+  // 1) Pump trade-local (si tu veux tenter d'abord)
   if (preferPump) {
     try {
-      const r = await pumpTradeLocalBuildAndSend({ mint });
-      return { ...r, priceGuess: null };
+      // Pump ne permet pas d’injecter proprement le TIP; /fast le refusera -> on va LOG + fallback
+      const pumpTx = await pumpTradeLocalBuildTx({
+        mint,
+        solAmount: CFG.TRADE_SIZE_SOL,
+        slippagePct: CFG.MAX_SLIPPAGE,
+      });
+      // On ESSAIE quand même (certaines régions /fast peuvent tolérer ?), sinon Helius renverra l’erreur "must send a tip..."
+      try {
+        //const sig = await sendViaHeliusFAST(pumpTx);
+        // --- envoi via RPC normal (préflight OK, pas de tip requis)
+        const raw = pumpTx.serialize();
+        const sig = await connection.sendRawTransaction(raw, {
+          skipPreflight: false,
+          preflightCommitment: 'processed',
+        });
+        return { sig, via:'pump' };
+      } catch (e) {
+        warn('pump trade-local -> FAST reject:', e.message, ' => fallback Jupiter with embedded TIP');
+        // continue vers Jupiter
+      }
     } catch (e) {
-      warn(`pump trade-local failed -> fallback to Jupiter: ${e.message}`);
+      warn('pump trade-local failed -> fallback to Jupiter:', e.message);
     }
   }
 
-  // 2) Jupiter (réessais agressifs)
-  const lamports = Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL);
-  const bps = Math.floor(CFG.MAX_SLIPPAGE * 10000);
-
-  let quote = null;
-  for (let i=0; i<16; i++) {
-    try {
-      quote = await jupQuote({
-        inputMint: CFG.BASE_SOL_MINT,
-        outputMint: mint,
-        amountLamports: lamports,
-        slippageBps: bps,
-      });
-      break;
-    } catch {
-      await sleep(80);
-    }
+  // 2) Jupiter (instructions) + TIP dans la même TX
+  //    On quote (ré-essais agressifs)
+  let quote;
+  for (let i=0; i<14; i++) {
+    try { quote = await jupQuote({ inputMint: CFG.BASE_SOL_MINT, outputMint: mint, amountLamports: lamports, slippageBps: bps }); break; }
+    catch { await sleep(100); }
   }
   if (!quote) throw new Error('No route from Jupiter (buy)');
 
-  const swapB64 = await jupBuildSwapTxBase64({
+  const vtx = await jupBuildSwapV0WithTip({
     quoteResponse: quote,
-    prioritizationFeeLamports: Math.floor(CFG.PRIORITY_FEE_SOL * LAMPORTS_PER_SOL),
+    tipLamports: CFG.INCLUDE_TIP ? CFG.TIP_LAMPORTS : 0,
+    tipAccount: tipAcc,
   });
 
-  const sig = await heliusSendRawBase64(swapB64);
+  const sig = await sendViaHeliusFAST(vtx);
   const px = priceFromQuote(quote);
-  return { sig, via: 'jupiter', priceGuess: px };
+  return { sig, via:'jupiter', priceGuess: px };
 }
 
 async function liveBuy(mint, preferPump) {
-  const { sig, via, priceGuess } = await buildAndSendBuyTx({ mint, preferPump });
+  const { sig, via, priceGuess } = await buildAndSendBuyTx_FAST({ mint, preferPump });
 
   const px = (priceGuess || 0.000001) * (1 + 0.5 * CFG.MAX_SLIPPAGE);
   const sizeToken = CFG.TRADE_SIZE_SOL / px;
@@ -385,17 +400,17 @@ async function liveSellPct(pct) {
   const sellTokenMint = position.mint;
   const sellSize = position.sizeToken * pct;
 
-  // Décimales via probe Jupiter
+  // Probe décimales via Jupiter
   const probe = await jupQuote({
     inputMint: CFG.BASE_SOL_MINT,
     outputMint: sellTokenMint,
     amountLamports: Math.floor(0.01 * LAMPORTS_PER_SOL),
     slippageBps: Math.floor(CFG.MAX_SLIPPAGE * 10000),
   }).catch(() => null);
-
-  let tokenDecimals = probe?.data?.[0]?.outAmountDecimals ?? 9;
+  const tokenDecimals = probe?.data?.[0]?.outAmountDecimals ?? 9;
   const tokenUnits = Math.max(1, Math.floor(sellSize * (10 ** tokenDecimals)));
 
+  // quote vente
   const sellQuote = await jupQuote({
     inputMint: sellTokenMint,
     outputMint: CFG.BASE_SOL_MINT,
@@ -403,14 +418,14 @@ async function liveSellPct(pct) {
     slippageBps: Math.floor(CFG.MAX_SLIPPAGE * 10000),
   });
 
-  const swapB64 = await jupBuildSwapTxBase64({
+  // build v0 + tip (même tx) pour /fast
+  const vtx = await jupBuildSwapV0WithTip({
     quoteResponse: sellQuote,
-    prioritizationFeeLamports: Math.floor(CFG.PRIORITY_FEE_SOL * LAMPORTS_PER_SOL),
+    tipLamports: CFG.INCLUDE_TIP ? CFG.TIP_LAMPORTS : 0,
+    tipAccount: CFG.INCLUDE_TIP ? pickTipAccount() : null,
   });
 
-  try { await sendHeliusTip(); } catch {}
-  const sig = await heliusSendRawBase64(swapB64);
-
+  const sig = await sendViaHeliusFAST(vtx);
   const px = priceFromQuote(sellQuote) || position.entry;
   const proceedsSOL = sellSize * (px * (1 - 0.5 * CFG.MAX_SLIPPAGE));
   const pnl = proceedsSOL - (sellSize * position.entry);
@@ -440,7 +455,7 @@ async function managePositionLoop() {
     }
     if (down >= CFG.HARD_SL) { await liveSellPct(1.0); break; }
 
-    await sleep(120);
+    await sleep(130);
   }
 }
 
@@ -454,7 +469,6 @@ app.use((err, req, res, next) => {
 app.use((req,_res,next)=>{ if(req.path==='/helius-webhook'){ const l=Number(req.headers['content-length']||0); dbg(`[hit] ${req.path} bodySize=${l}B`); if(Array.isArray(req.body)) dbg('[hit] batchLen=', req.body.length); else if(req.body) dbg('[hit] batchLen= 1'); } next(); });
 
 const seenMint = new Map();
-
 function isPumpEvent(payload) {
   if (payload?.source === 'PUMP_AMM') return true;
   const progs = collectPrograms(payload);
@@ -484,16 +498,10 @@ app.post('/helius-webhook', async (req, res) => {
     info(`🚀 Nouveau token détecté: ${mint} | type=${t} source=${src} | ~${fmt(added)} SOL ajoutés`);
     csv({ event:'detect', sol:added, token:mint, extra:`type=${t}|source=${src}|slot=${slot}` });
 
-    if (added < CFG.TRIGGER_MIN_SOL) {
-      dbg(`skip: below-threshold (${fmt(added)} < ${CFG.TRIGGER_MIN_SOL})`);
-      return res.status(200).send({ ok:true, note:'below-threshold', added });
-    }
+    if (added < CFG.TRIGGER_MIN_SOL) { dbg(`skip: below-threshold (${fmt(added)} < ${CFG.TRIGGER_MIN_SOL})`); return res.status(200).send({ ok:true, note:'below-threshold', added }); }
 
     const now = Date.now();
-    if (seenMint.get(mint) && now - seenMint.get(mint) < 30000) {
-      dbg('skip: cooldown 30s');
-      return res.status(200).send({ ok:true, note:'cooldown' });
-    }
+    if (seenMint.get(mint) && now - seenMint.get(mint) < 30000) { dbg('skip: cooldown 30s'); return res.status(200).send({ ok:true, note:'cooldown' }); }
     seenMint.set(mint, now);
 
     const preferPump = isPumpEvent(payload);
@@ -502,12 +510,7 @@ app.post('/helius-webhook', async (req, res) => {
       await liveBuy(mint, preferPump);
       managePositionLoop().catch(()=>{});
       if (CFG.EXIT_TIMEOUT_MS > 0) {
-        setTimeout(async () => {
-          if (position && position.mint === mint) {
-            info(`⏳ Timeout ${CFG.EXIT_TIMEOUT_MS}ms => sortie totale`);
-            await liveSellPct(1.0);
-          }
-        }, CFG.EXIT_TIMEOUT_MS);
+        setTimeout(async () => { if (position && position.mint === mint) { info(`⏳ Timeout ${CFG.EXIT_TIMEOUT_MS}ms => sortie totale`); await liveSellPct(1.0); } }, CFG.EXIT_TIMEOUT_MS);
       }
       return res.status(200).send({ ok:true, triggered:true, mint, added, preferPump });
     } catch (e) {
@@ -526,6 +529,7 @@ app.get('/health', (_req, res) => res.send({
   wallet: WALLET_PK,
   triggerMinSol: CFG.TRIGGER_MIN_SOL,
   amm: { strict: CFG.AMM_STRICT, allow: CFG.AMM_PROGRAM_IDS },
+  tip: { include: CFG.INCLUDE_TIP, lamports: CFG.TIP_LAMPORTS, accounts: CFG.TIP_ACCOUNTS.length },
 }));
 
 app.listen(CFG.PORT, () => {
