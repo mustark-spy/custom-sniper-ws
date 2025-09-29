@@ -1,6 +1,25 @@
 /**
  * Snipe webhook -> entrée auto si add_liquidity >= seuil puis scalp 0.15 SOL
  * Paper trading par défaut (MODE=paper). Log CSV + console.
+ *
+ * ENV clefs:
+ *  MODE=paper|live
+ *  PORT=10000
+ *  RPC_URL=...
+ *  BASE_SOL_MINT=So11111111111111111111111111111111111111112
+ *  TRIGGER_MIN_SOL=200
+ *  TRADE_SIZE_SOL=0.15
+ *  MAX_SLIPPAGE=0.30
+ *  PRIORITY_FEE_SOL=0.008
+ *  TP1_PCT=0.40
+ *  TP1_SELL=0.70
+ *  TRAIL_GAP=0.15
+ *  HARD_SL=0.35
+ *  EXIT_TIMEOUT_MS=15000    // 0 pour désactiver
+ *  JUPITER_QUOTE_URL=https://quote-api.jup.ag/v6/quote
+ *  AMM_PROGRAM_IDS=comma,separated,programIds (optionnel)
+ *  CSV_FILE=paper_trades.csv
+ *  LOG_LEVEL=debug|info
  */
 
 import 'dotenv/config';
@@ -10,10 +29,7 @@ import fetch from 'node-fetch';
 import fs from 'fs';
 import {
   Connection,
-  PublicKey,
   LAMPORTS_PER_SOL,
-  VersionedTransaction,
-  Keypair,
 } from '@solana/web3.js';
 
 // -------------------- Config --------------------
@@ -280,9 +296,14 @@ async function managePositionLoop() {
   }
 }
 
-// -------------------- Webhook --------------------
+// -------------------- Webhook (robuste & verbeux) --------------------
 const app = express();
-app.use(bodyParser.json({ limit: '20mb' }));   // ou 20mb si tu veux être large
+
+// 1) parsers: JSON + fallback texte (si content-type non standard)
+app.use(bodyParser.json({ limit: '25mb' }));              // batch Helius peut être lourd
+app.use(bodyParser.text({ type: '*/*', limit: '25mb' })); // fallback si JSON échoue
+
+// 2) trap d’erreur “too large” + log
 app.use((err, req, res, next) => {
   if (err?.type === 'entity.too.large') {
     console.error('Body too large:', err.message);
@@ -290,83 +311,112 @@ app.use((err, req, res, next) => {
   }
   next(err);
 });
-// anti re-fire: on ne traite qu’une fois par mint (cooldown court)
+
+const LOG_DEBUG = (process.env.LOG_LEVEL || 'info').toLowerCase() === 'debug';
 const seenMint = new Map(); // mint => ts
 
-app.post('/helius-webhook', (req, res, next) => {
-  if (!req.body) console.warn('Webhook hit but req.body is empty or failed to parse');
-  next();
-});
+// util: parser robuste
+function parseHeliusBody(req) {
+  try {
+    // cas normal: body déjà objet/array
+    if (Array.isArray(req.body) || (req.body && typeof req.body === 'object')) {
+      return req.body;
+    }
+    // fallback: body texte -> JSON.parse
+    if (typeof req.body === 'string' && req.body.trim().length) {
+      return JSON.parse(req.body);
+    }
+  } catch (e) {
+    console.error('JSON parse error:', e.message);
+  }
+  return null;
+}
 
 app.post('/helius-webhook', async (req, res) => {
+  // LOG: hit minimal
+  const rawLen =
+    typeof req.body === 'string'
+      ? Buffer.byteLength(req.body, 'utf8')
+      : Buffer.byteLength(JSON.stringify(req.body || ''), 'utf8');
+  if (LOG_DEBUG) console.log(`[hit] /helius-webhook bodySize=${rawLen}B`);
+
+  const parsed = parseHeliusBody(req);
+  if (!parsed) {
+    console.warn('Webhook hit but body is empty or unparsable');
+    return res.status(400).send({ ok: false, error: 'unparsable-body' });
+  }
+
+  const batch = Array.isArray(parsed) ? parsed : [parsed];
+  if (LOG_DEBUG) console.log(`[hit] batchLen=${batch.length}`);
+
   try {
-    const payload = Array.isArray(req.body) ? req.body[0] : req.body;
-    const t = payload?.type || 'UNKNOWN';
-    const src = payload?.source || 'unknown';
+    for (const payload of batch) {
+      const t = payload?.type || 'UNKNOWN';
+      const src = payload?.source || 'unknown';
 
-    // types surveillés
-    if (!['CREATE_POOL','ADD_LIQUIDITY'].includes(t)) {
-      return res.status(200).send({ ok:true, note:'ignored-type' });
-    }
-
-    // filtre AMM (si fourni)
-    if (!ammAllowed(payload)) {
-      return res.status(200).send({ ok:true, note:'amm-filter-skip' });
-    }
-
-    const mint = extractMint(payload);
-    const added = estimateSolAdded(payload);
-    const slot = payload?.slot;
-
-    if (!mint) {
-      console.log('No candidate mint found');
-      return res.status(200).send({ ok:true, note:'no-mint' });
-    }
-
-    console.log(
-      `🚀 Nouveau token détecté: ${mint} | type=${t}  source=${src} | ~${fmt(added)} SOL ajoutés`
-    );
-
-    // log CSV détection
-    csv({ event:'detect', side:'', price:'', sol:added, token:mint, extra:`type=${t}|source=${src}|slot=${slot}` });
-
-    // Antirepeat ~ 30s
-    const now = Date.now();
-    if (seenMint.get(mint) && now - seenMint.get(mint) < 30000) {
-      return res.status(200).send({ ok:true, note:'cooldown' });
-    }
-    seenMint.set(mint, now);
-
-    // Déclenche si liquidité >= seuil
-    if (added >= CFG.TRIGGER_MIN_SOL && CFG.MODE === 'paper') {
-      // Estime un "entry guess" à partir de la taille d’achat: suppose route dispo
-      const lamports = Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL);
-      let entryGuess = null;
-      try {
-        entryGuess = await jupSpotPrice({
-          inputMint: CFG.BASE_SOL_MINT,
-          outputMint: mint,
-          amountLamports: lamports,
-          slippageBps: Math.floor(CFG.MAX_SLIPPAGE * 10000),
-        });
-      } catch {
-        entryGuess = 0.000001; // fallback minuscule pour éviter NaN
+      if (!['CREATE_POOL', 'ADD_LIQUIDITY'].includes(t)) {
+        if (LOG_DEBUG) console.log(`skip: ignored-type (${t})`);
+        continue;
       }
-      await paperEnter(mint, entryGuess);
-      return res.status(200).send({ ok:true, triggered:true, mint, added });
+
+      if (!ammAllowed(payload)) {
+        if (LOG_DEBUG) console.log('skip: amm-filter-skip');
+        continue;
+      }
+
+      const mint = extractMint(payload);
+      const added = estimateSolAdded(payload);
+      const slot = payload?.slot;
+
+      if (!mint) {
+        if (LOG_DEBUG) console.log('skip: No candidate mint found');
+        continue;
+      }
+
+      console.log(
+        `🚀 Nouveau token détecté: ${mint} | type=${t}  source=${src} | ~${fmt(added)} SOL ajoutés`
+      );
+      csv({ event:'detect', side:'', price:'', sol:added, token:mint, extra:`type=${t}|source=${src}|slot=${slot}` });
+
+      const now = Date.now();
+      const last = seenMint.get(mint);
+      if (last && now - last < 30000) {
+        if (LOG_DEBUG) console.log(`cooldown: already seen ${mint} (${now - last}ms)`);
+        continue;
+      }
+      seenMint.set(mint, now);
+
+      if (added >= CFG.TRIGGER_MIN_SOL && CFG.MODE === 'paper') {
+        const lamports = Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL);
+        let entryGuess = 0.000001;
+        try {
+          entryGuess = await jupSpotPrice({
+            inputMint: CFG.BASE_SOL_MINT,
+            outputMint: mint,
+            amountLamports: lamports,
+            slippageBps: Math.floor(CFG.MAX_SLIPPAGE * 10000),
+          });
+        } catch (e) {
+          if (LOG_DEBUG) console.log(`quote miss (fallback) for ${mint}:`, e.message);
+        }
+        await paperEnter(mint, entryGuess);
+        if (LOG_DEBUG) console.log(`triggered: paper enter ${mint} (added=${fmt(added)} SOL)`);
+      } else {
+        if (LOG_DEBUG) console.log(`logged: below trigger or not paper (added=${fmt(added)} SOL)`);
+      }
     }
 
-    // (live) if (added >= CFG.TRIGGER_MIN_SOL && CFG.MODE === 'live') { ... }
-
-    return res.status(200).send({ ok:true, note:'logged' });
+    return res.status(200).send({ ok: true });
   } catch (e) {
-    console.error('webhook error', e);
-    return res.status(500).send({ ok:false, error: e.message });
+    console.error('webhook handler error:', e);
+    return res.status(500).send({ ok: false, error: e.message });
   }
 });
 
-app.get('/health', (_req, res) => res.send({ ok:true, mode: CFG.MODE, triggerMinSol: CFG.TRIGGER_MIN_SOL }));
+app.get('/health', (_req, res) =>
+  res.send({ ok:true, mode: CFG.MODE, triggerMinSol: CFG.TRIGGER_MIN_SOL })
+);
 
 app.listen(CFG.PORT, () => {
-  console.log(`Webhook listener on :${CFG.PORT} — mode=${CFG.MODE}`);
+  console.log(`Webhook listener on :${CFG.PORT} — mode=${CFG.MODE} (LOG_LEVEL=${process.env.LOG_LEVEL || 'info'})`);
 });
