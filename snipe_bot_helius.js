@@ -179,6 +179,17 @@ async function pumpTradeLocalBuy({ mint, amountSol, slippagePct, priorityFeeSol 
 
 // -------------------- Helius Sender --------------------
 async function sendRawViaHelius(rawB64) {
+  // Le Sender /fast n'accepte pas de preflight.
+  // Options minimalistes + skipPreflight explicite.
+  const params = [
+    rawB64,
+    {
+      encoding: 'base64',
+      skipPreflight: true,   // <- important pour /fast
+      maxRetries: 0          // evite des replays inutiles; ajuste si besoin
+    }
+  ];
+
   const res = await fetch(CFG.HELIUS_SENDER_URL, {
     method: 'POST',
     headers: { 'Content-Type':'application/json' },
@@ -186,9 +197,10 @@ async function sendRawViaHelius(rawB64) {
       jsonrpc: '2.0',
       id: 'helius-snipe',
       method: 'sendTransaction',
-      params: [rawB64, { encoding: 'base64', preflightCommitment: 'processed' }],
+      params
     }),
   });
+
   const data = await res.json();
   if (!data?.result) throw new Error(`Helius sender error: ${JSON.stringify(data)}`);
   return data.result;
