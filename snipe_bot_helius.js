@@ -1,8 +1,8 @@
 /**
- * Webhook Helius -> Achat live ultra-rapide :
- *   1) Pump Portal trade-local (réessais ultra-courts)
- *   2) Fallback Jupiter + Sender /fast (avec TIP embarqué)
- * Sorties: TP/SL/Trailing + timeout.
+ * Webhook Helius -> Achat live:
+ * 1) Pump trade-local (réessais agressifs, escalation fee, pump-amm puis auto)
+ * 2) Fallback Jupiter + Sender /fast avec TIP embarqué
+ * + TP/SL/Trailing + timeout
  */
 
 import 'dotenv/config';
@@ -32,11 +32,17 @@ const CFG = {
 
   TRADE_SIZE_SOL: Number(process.env.TRADE_SIZE_SOL || 0.15),
   MAX_SLIPPAGE: Number(process.env.MAX_SLIPPAGE || 0.30),
+
+  // Priority fee (SOL) pour BUY/SELL côté Pump (escalade)
+  PUMP_MIN_PRIORITY_FEE: Number(process.env.PUMP_MIN_PRIORITY_FEE || 0.00001),
+  PUMP_MAX_PRIORITY_FEE: Number(process.env.PUMP_MAX_PRIORITY_FEE || 0.0005),
+
+  // Priority fee de base à inclure côté Jupiter (dans la construction d'instructions)
   PRIORITY_FEE_SOL: Number(process.env.PRIORITY_FEE_SOL || 0.008),
 
   TP1_PCT: Number(process.env.TP1_PCT || 0.40),
   TP1_SELL: Number(process.env.TP1_SELL || 0.70),
-  TRAIL_GAP: Number(process.env.TRAIL_GAP || 0.15),
+  TRAIL_GAP: Number(process.env.TRAIL_GAP || 0.20),
   HARD_SL: Number(process.env.HARD_SL || 0.35),
   EXIT_TIMEOUT_MS: Number(process.env.EXIT_TIMEOUT_MS || 15000),
 
@@ -46,11 +52,12 @@ const CFG = {
 
   // Pump Portal
   PUMP_TRADE_LOCAL_URL: process.env.PUMP_TRADE_LOCAL_URL || 'https://pumpportal.fun/api/trade-local',
-  PUMP_RETRIES: Number(process.env.PUMP_RETRIES || 10),       // nb de tentatives trade-local
-  PUMP_RETRY_MS: Number(process.env.PUMP_RETRY_MS || 120),    // attente entre tentatives (ms)
+  PUMP_RETRIES: Number(process.env.PUMP_RETRIES || 40),         // jusqu'à ~2–3s
+  PUMP_RETRY_MIN_MS: Number(process.env.PUMP_RETRY_MIN_MS || 50),
+  PUMP_RETRY_MAX_MS: Number(process.env.PUMP_RETRY_MAX_MS || 120),
 
   // Helius Sender (FAST)
-  HELIUS_SENDER_URL: process.env.HELIUS_SENDER_URL || '',
+  HELIUS_SENDER_URL: process.env.HELIUS_SENDER_URL || 'http://ewr-sender.helius-rpc.com/fast',
 
   // AMM allowlist
   AMM_PROGRAM_IDS: (process.env.AMM_PROGRAM_IDS || '')
@@ -59,7 +66,7 @@ const CFG = {
     .filter(Boolean),
   AMM_STRICT: ['1','true','yes'].includes(String(process.env.AMM_STRICT || '').toLowerCase()),
 
-  // TIP (OBLIGATOIRE pour /fast -> doit être dans la même TX !)
+  // TIP (OBLIGATOIRE pour /fast -> même TX)
   INCLUDE_TIP: ['1','true','yes'].includes(String(process.env.INCLUDE_TIP || '').toLowerCase()),
   TIP_LAMPORTS: Number(process.env.TIP_LAMPORTS || 1000000), // >= 0.001 SOL
   TIP_ACCOUNTS: (process.env.TIP_ACCOUNTS || '').split(',').map(s => s.trim()).filter(Boolean),
@@ -95,9 +102,10 @@ const csv = (row) => {
 };
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const jitter = (min, max) => Math.floor(Math.random()*(max-min+1))+min;
 const fmt = (n) => Number(n).toFixed(6);
 
-// -------------------- Helpers Jupiter --------------------
+// -------------------- Jupiter helpers --------------------
 async function jupQuote({ inputMint, outputMint, amountLamports, slippageBps }) {
   const url = new URL(CFG.JUP_Q_URL);
   url.searchParams.set('inputMint', inputMint);
@@ -121,7 +129,6 @@ function priceFromQuote(q) {
   return inAmt / outAmt;
 }
 
-// Build V0 tx with Jupiter swap-instructions + TIP instruction (same tx !)
 async function jupBuildSwapV0WithTip({ quoteResponse, tipLamports, tipAccount }) {
   const insRes = await fetch(CFG.JUP_SWAP_INS_URL, {
     method: 'POST',
@@ -142,7 +149,6 @@ async function jupBuildSwapV0WithTip({ quoteResponse, tipLamports, tipAccount })
   const { setupInstructions = [], swapInstruction, cleanupInstruction, addressLookupTables = [] } = insData || {};
   if (!swapInstruction) throw new Error('swap-instructions: missing swapInstruction');
 
-  // Resolve ALTs
   const altAccounts = [];
   for (const addr of addressLookupTables) {
     const pub = new PublicKey(addr);
@@ -156,7 +162,6 @@ async function jupBuildSwapV0WithTip({ quoteResponse, tipLamports, tipAccount })
   ix.push(swapInstruction);
   if (cleanupInstruction) ix.push(cleanupInstruction);
 
-  // TIP in the same tx (required by /fast)
   if (CFG.INCLUDE_TIP && tipLamports > 0 && tipAccount) {
     ix.push(SystemProgram.transfer({
       fromPubkey: wallet.publicKey,
@@ -177,47 +182,67 @@ async function jupBuildSwapV0WithTip({ quoteResponse, tipLamports, tipAccount })
   return vtx;
 }
 
-// -------------------- Pump trade-local (avec réessais) --------------------
-async function pumpTradeLocalBuildTx({ mint, solAmount, slippagePct }) {
+// -------------------- Pump trade-local amélioré --------------------
+async function pumpTradeLocalTryOnce({ mint, solAmount, slippagePct, priorityFee, pool, denomAsString }) {
   const body = {
     publicKey: WALLET_PK,
     action: 'buy',
     mint,
-    denominatedInSol: 'true',                 // "true" => amount exprimé en SOL
-    amount: Number(solAmount),                // ex: 0.15
-    slippage: Math.round(slippagePct * 100),  // 0.30 => 30 (%)
-    priorityFee: Number(CFG.PRIORITY_FEE_SOL || 0), // en SOL
-    pool: 'auto',
+    denominatedInSol: denomAsString ? 'true' : true,  // teste string OU boolean
+    amount: Number(solAmount),                        // en SOL
+    slippage: Math.round(slippagePct * 100),          // 0.30 => 30 (%)
+    priorityFee: Number(priorityFee),                 // SOL
+    pool,                                            // 'pump-amm' ou 'auto'
   };
 
-  let lastErrTxt = '';
-  for (let i = 0; i < CFG.PUMP_RETRIES; i++) {
-    const res = await fetch(CFG.PUMP_TRADE_LOCAL_URL, {
-      method: 'POST',
-      headers: { 'Content-Type':'application/json' },
-      body: JSON.stringify(body),
-    });
+  const res = await fetch(CFG.PUMP_TRADE_LOCAL_URL, {
+    method: 'POST',
+    headers: { 'Content-Type':'application/json' },
+    body: JSON.stringify(body),
+  });
 
-    if (res.ok) {
-      const buf = new Uint8Array(await res.arrayBuffer());
-      return VersionedTransaction.deserialize(buf);
-    }
-
-    // log lisible
-    const txt = await res.text().catch(()=>'');
-    lastErrTxt = `pump trade-local ${res.status}: ${txt}`;
-    // cas classique juste après CREATE_POOL: {"size":0} / "Bad Request" -> attendre un battement puis retenter
-    if (res.status === 400 && /size"?\s*:?0|Bad Request/i.test(txt)) {
-      await sleep(CFG.PUMP_RETRY_MS);
-      continue;
-    }
-    // autres erreurs -> stop
-    break;
+  if (res.ok) {
+    const buf = new Uint8Array(await res.arrayBuffer());
+    return { vtx: VersionedTransaction.deserialize(buf), err: null, rawErr: null };
   }
-  throw new Error(lastErrTxt || 'pump trade-local failed');
+
+  const txt = await res.text().catch(()=> '');
+  return { vtx: null, err: `pump trade-local ${res.status}`, rawErr: txt || null };
 }
 
-// -------------------- Helius Sender (FAST) --------------------
+async function pumpTradeLocalBuildTxAggressive({ mint, solAmount, slippagePct }) {
+  // escalade priorityFee de min -> max sur la fenêtre de retries
+  const minF = CFG.PUMP_MIN_PRIORITY_FEE;
+  const maxF = CFG.PUMP_MAX_PRIORITY_FEE;
+  const steps = Math.max(1, CFG.PUMP_RETRIES - 1);
+
+  for (let i = 0; i < CFG.PUMP_RETRIES; i++) {
+    const alpha = i / steps;
+    const fee = minF + (maxF - minF) * alpha;
+
+    // 1) d’abord pump-amm + denominatedInSol boolean
+    let r = await pumpTradeLocalTryOnce({ mint, solAmount, slippagePct, priorityFee: fee, pool: 'pump-amm', denomAsString: false });
+    if (r.vtx) return r.vtx;
+
+    // 2) s’il échoue, retente rapidement avec denominatedInSol "true" (string)
+    r = await pumpTradeLocalTryOnce({ mint, solAmount, slippagePct, priorityFee: fee, pool: 'pump-amm', denomAsString: true });
+    if (r.vtx) return r.vtx;
+
+    // 3) dernier essai sur ce cycle en 'auto'
+    r = await pumpTradeLocalTryOnce({ mint, solAmount, slippagePct, priorityFee: fee, pool: 'auto', denomAsString: false });
+    if (r.vtx) return r.vtx;
+
+    // LOG clair du motif (montre le JSON entier quand possible)
+    if (r.err) {
+      warn(`[pump] attempt ${i+1}/${CFG.PUMP_RETRIES} — ${r.err} — body=${r.rawErr}`);
+    }
+
+    await sleep(jitter(CFG.PUMP_RETRY_MIN_MS, CFG.PUMP_RETRY_MAX_MS));
+  }
+  throw new Error('pump trade-local: all retries exhausted');
+}
+
+// -------------------- Sender /fast --------------------
 async function sendViaHeliusFAST(versionedTx) {
   const raw = Buffer.from(versionedTx.serialize()).toString('base64');
   const res = await fetch(CFG.HELIUS_SENDER_URL, {
@@ -235,8 +260,8 @@ async function sendViaHeliusFAST(versionedTx) {
   return data.result;
 }
 
-// -------------------- Price probe (TP/SL/trail) --------------------
-async function spotPriceFast(mint, { attempts = 12 } = {}) {
+// -------------------- Price/TP/SL --------------------
+async function spotPriceFast(mint, { attempts = 14 } = {}) {
   const lamports = Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL);
   const bps = Math.floor(CFG.MAX_SLIPPAGE * 10000);
   for (let i = 0; i < attempts; i++) {
@@ -250,7 +275,7 @@ async function spotPriceFast(mint, { attempts = 12 } = {}) {
   return null;
 }
 
-// -------------------- AMM filter & extraction --------------------
+// -------------------- AMM helpers --------------------
 function collectPrograms(payload) {
   const keys = payload?.transaction?.message?.accountKeys || [];
   const seen = new Set();
@@ -333,42 +358,40 @@ const trailStopPrice = (p) => p.high * (1 - CFG.TRAIL_GAP);
 const pickTipAccount = () => CFG.TIP_ACCOUNTS.length ? CFG.TIP_ACCOUNTS[Math.floor(Math.random()*CFG.TIP_ACCOUNTS.length)] : null;
 
 async function buildAndSendBuyTx_FAST({ mint, preferPump }) {
-  const lamports = Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL);
-  const bps = Math.floor(CFG.MAX_SLIPPAGE * 10000);
-  const tipAcc = CFG.INCLUDE_TIP ? pickTipAccount() : null;
-
-  // 1) Pump trade-local avec réessais très courts (envoi via RPC normal)
+  // 1) Pump trade-local agressif (RPC normal)
   if (preferPump) {
     try {
-      const pumpTx = await pumpTradeLocalBuildTx({
+      const pumpTx = await pumpTradeLocalBuildTxAggressive({
         mint,
         solAmount: CFG.TRADE_SIZE_SOL,
         slippagePct: CFG.MAX_SLIPPAGE,
       });
-
       const raw = pumpTx.serialize();
       const sig = await connection.sendRawTransaction(raw, {
         skipPreflight: false,
         preflightCommitment: 'processed',
       });
-      return { sig, via:'pump' };
+      return { sig, via: 'pump', priceGuess: null };
     } catch (e) {
-      warn('pump trade-local failed -> fallback to Jupiter:', e.message);
+      warn('pump trade-local exhausted -> fallback Jupiter:', e.message);
     }
   }
 
-  // 2) Jupiter (instructions) + TIP in-tx, envoi via /fast
+  // 2) Jupiter (instructions) + TIP en-tx -> /fast
+  const lamports = Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL);
+  const bps = Math.floor(CFG.MAX_SLIPPAGE * 10000);
+
   let quote;
-  for (let i=0; i<14; i++) {
+  for (let i=0; i<16; i++) {
     try { quote = await jupQuote({ inputMint: CFG.BASE_SOL_MINT, outputMint: mint, amountLamports: lamports, slippageBps: bps }); break; }
-    catch { await sleep(100); }
+    catch { await sleep(120); }
   }
   if (!quote) throw new Error('No route from Jupiter (buy)');
 
   const vtx = await jupBuildSwapV0WithTip({
     quoteResponse: quote,
     tipLamports: CFG.INCLUDE_TIP ? CFG.TIP_LAMPORTS : 0,
-    tipAccount: tipAcc,
+    tipAccount: CFG.INCLUDE_TIP ? pickTipAccount() : null,
   });
 
   const sig = await sendViaHeliusFAST(vtx);
@@ -427,7 +450,7 @@ async function liveSellPct(pct) {
 
 async function managePositionLoop() {
   while (position) {
-    const px = await spotPriceFast(position.mint, { attempts: 6 }) || position.entry;
+    const px = await spotPriceFast(position.mint, { attempts: 8 }) || position.entry;
     if (px > position.high) position.high = px;
 
     const up = px / position.entry - 1;
@@ -443,7 +466,7 @@ async function managePositionLoop() {
     }
     if (down >= CFG.HARD_SL) { await liveSellPct(1.0); break; }
 
-    await sleep(130);
+    await sleep(120);
   }
 }
 
@@ -515,7 +538,7 @@ app.get('/health', (_req, res) => res.send({
   triggerMinSol: CFG.TRIGGER_MIN_SOL,
   amm: { strict: CFG.AMM_STRICT, allow: CFG.AMM_PROGRAM_IDS },
   tip: { include: CFG.INCLUDE_TIP, lamports: CFG.TIP_LAMPORTS, accounts: CFG.TIP_ACCOUNTS.length },
-  pump: { retries: CFG.PUMP_RETRIES, retryMs: CFG.PUMP_RETRY_MS },
+  pump: { retries: CFG.PUMP_RETRIES, retryMinMs: CFG.PUMP_RETRY_MIN_MS, retryMaxMs: CFG.PUMP_RETRY_MAX_MS, minFee: CFG.PUMP_MIN_PRIORITY_FEE, maxFee: CFG.PUMP_MAX_PRIORITY_FEE },
 }));
 
 app.listen(CFG.PORT, () => {
