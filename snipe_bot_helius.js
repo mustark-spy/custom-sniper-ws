@@ -1,57 +1,49 @@
 /**
- * Sniper Pump.fun via GMGN Router — buy/sell market + TP/SL/Trailing/Timeout
- * - Entrées/Sorties via GMGN (multi-AMM auto)
- * - Prix spot pour TP/SL via Jupiter Quote (rapide), pas de swap Jupiter.
+ * GMGN Sniper — entrée rapide sur CREATE_POOL puis sortie au timeout (100%).
+ * - Conditions d'entrée : age(pool) <= MAX_POOL_AGE_MS ET SOL ajoutés >= TRIGGER_MIN_SOL
+ * - Achat: SOL -> token (GMGN router + submit)
+ * - Sortie: token -> SOL (GMGN router + submit) à t+EXIT_TIMEOUT_MS
  */
 
 import 'dotenv/config';
 import express from 'express';
 import bodyParser from 'body-parser';
 import fetch from 'node-fetch';
-import fs from 'fs';
 import bs58 from 'bs58';
 import {
   Connection,
-  LAMPORTS_PER_SOL,
-  VersionedTransaction,
   Keypair,
+  VersionedTransaction,
   PublicKey,
+  LAMPORTS_PER_SOL,
 } from '@solana/web3.js';
 
-// ====================== Config ======================
+// -------------------- Config --------------------
 const CFG = {
-  MODE: (process.env.MODE || 'live').toLowerCase(),
   PORT: Number(process.env.PORT || 10000),
   RPC_URL: process.env.RPC_URL || 'https://api.mainnet-beta.solana.com',
 
-  // Déclencheur min d’add_liquidity (en SOL) pour snip
-  TRIGGER_MIN_SOL: Number(process.env.TRIGGER_MIN_SOL || 50),
+  // Détection & gating
+  TRIGGER_MIN_SOL: Number(process.env.TRIGGER_MIN_SOL || 200),  // min SOL ajoutés pour trigger
+  MAX_POOL_AGE_MS: Number(process.env.MAX_POOL_AGE_MS || 5000), // ex: 5000 = 5s
 
-  // Trade
-  TRADE_SIZE_SOL: Number(process.env.TRADE_SIZE_SOL || 0.15),
-  MAX_SLIPPAGE: Number(process.env.MAX_SLIPPAGE || 0.30), // 30% => 30
-  PRIORITY_FEE_SOL: Number(process.env.PRIORITY_FEE_SOL || 0.004), // GMGN fee total
-  IS_ANTI_MEV: ['1','true','yes'].includes(String(process.env.IS_ANTI_MEV || '').toLowerCase()),
+  // Entrée
+  TRADE_SIZE_SOL: Number(process.env.TRADE_SIZE_SOL || 0.20),   // taille de l'ordre en SOL
+  MAX_SLIPPAGE: Number(process.env.MAX_SLIPPAGE || 0.30),       // ex: 0.30 (30%)
+  PRIORITY_FEE_SOL: Number(process.env.PRIORITY_FEE_SOL || 0.006),
 
-  // Strategy
-  TP1_PCT: Number(process.env.TP1_PCT || 0.40),   // +40%
-  TP1_SELL: Number(process.env.TP1_SELL || 0.70), // vend 70% sur TP1
-  TRAIL_GAP: Number(process.env.TRAIL_GAP || 0.15), // stop suiveur 15% sous le plus haut
-  HARD_SL: Number(process.env.HARD_SL || 0.35),     // -35% hard stop
-  EXIT_TIMEOUT_MS: Number(process.env.EXIT_TIMEOUT_MS || 15000), // 0 pour désactiver
+  // Sortie
+  EXIT_TIMEOUT_MS: Number(process.env.EXIT_TIMEOUT_MS || 8000), // ex: 8000ms
+
+  // Base SOL (WSOL)
+  BASE_SOL_MINT: process.env.BASE_SOL_MINT || 'So11111111111111111111111111111111111111112',
 
   // GMGN
-  GMGN_API: process.env.GMGN_API || 'https://gmgn.ai',
-
-  // Jupiter (quote only)
-  JUP_Q_URL: process.env.JUPITER_QUOTE_URL || 'https://quote-api.jup.ag/v6/quote',
-  BASE_SOL_MINT: 'So11111111111111111111111111111111111111112',
+  GMGN_HOST: process.env.GMGN_HOST || 'https://gmgn.ai',
 
   // Wallet
-  WALLET_SECRET_KEY: process.env.WALLET_SECRET_KEY || '', // base58
+  WALLET_SECRET_KEY: process.env.WALLET_SECRET_KEY || '', // base58 secret key
 
-  // Divers
-  CSV_FILE: process.env.CSV_FILE || 'live_trades.csv',
   LOG_LEVEL: (process.env.LOG_LEVEL || 'info').toLowerCase(),
 };
 
@@ -60,160 +52,62 @@ const info = (...a) => console.log(...a);
 const warn = (...a) => console.warn(...a);
 const err  = (...a) => console.error(...a);
 
-if (!CFG.WALLET_SECRET_KEY) { err('❌ WALLET_SECRET_KEY manquant'); process.exit(1); }
+if (!CFG.WALLET_SECRET_KEY) {
+  err('❌ WALLET_SECRET_KEY manquant (base58).');
+  process.exit(1);
+}
 
-// ====================== Setup ======================
+// -------------------- Setup --------------------
 const connection = new Connection(CFG.RPC_URL, { commitment: 'processed' });
 const wallet = Keypair.fromSecretKey(bs58.decode(CFG.WALLET_SECRET_KEY));
 const WALLET_PK = wallet.publicKey.toBase58();
 
-if (!fs.existsSync(CFG.CSV_FILE)) {
-  fs.writeFileSync(CFG.CSV_FILE, 'time,event,side,price,sol,token,extra\n');
-}
-const csv = (r) => {
-  const line = `${new Date().toISOString()},${r.event},${r.side||''},${r.price||''},${r.sol||''},${r.token||''},${r.extra||''}\n`;
-  fs.appendFileSync(CFG.CSV_FILE, line);
-};
-
+// -------------------- Utils --------------------
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const fmt = (n) => Number(n).toFixed(6);
+const fmt6  = (n) => Number(n).toFixed(6);
 
-// ====================== Jupiter quote (prix uniquement) ======================
-async function jupQuote({ inputMint, outputMint, amountLamports, slippageBps }) {
-  const url = new URL(CFG.JUP_Q_URL);
-  url.searchParams.set('inputMint', inputMint);
-  url.searchParams.set('outputMint', outputMint);
-  url.searchParams.set('amount', String(amountLamports));
-  url.searchParams.set('slippageBps', String(slippageBps));
-  url.searchParams.set('onlyDirectRoutes', 'false');
-  url.searchParams.set('asLegacyTransaction', 'false');
+function nowMs() { return Date.now(); }
 
-  const res = await fetch(url, { headers: { accept: 'application/json' } });
-  if (!res.ok) throw new Error(`Jupiter quote ${res.status}`);
-  const data = await res.json();
-  if (!data?.data?.length) throw new Error('No route');
-  return data;
-}
-function priceFromQuote(q) {
-  const r = q?.data?.[0];
-  if (!r) return null;
-  const inAmt = Number(r.inAmount) / (10 ** (r.inAmountDecimals ?? 9));
-  const outAmt = Number(r.outAmount) / (10 ** (r.outAmountDecimals ?? 9));
-  // SOL per TOKEN
-  return inAmt / outAmt;
-}
-async function spotPriceFast(mint, { attempts = 10 } = {}) {
-  const lamports = Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL);
-  const bps = Math.floor(CFG.MAX_SLIPPAGE * 10000);
-  for (let i=0;i<attempts;i++){
-    try {
-      const q = await jupQuote({
-        inputMint: CFG.BASE_SOL_MINT,
-        outputMint: mint,
-        amountLamports: lamports,
-        slippageBps: bps,
-      });
-      const px = priceFromQuote(q);
-      if (px) return px;
-    } catch {}
-    await sleep(120);
-  }
-  return null;
+function eventUnixMs(payload) {
+  // Helius enhanced a souvent timestamp / blockTime
+  const t =
+    (payload?.timestamp ? Number(payload.timestamp) * 1000 : null) ??
+    (payload?.blockTime ? Number(payload.blockTime) * 1000 : null);
+  return t || nowMs();
 }
 
-// ====================== GMGN helpers ======================
-function bpsFromSlippage(sl) { return Math.round(sl * 100); } // CFG.MAX_SLIPPAGE=0.30 -> 30
+function estimateSolAdded(payload) {
+  // essaie via tokenTransfers mints == WSOL
+  const solMint = CFG.BASE_SOL_MINT;
+  const transfers = payload?.tokenTransfers || [];
+  let sol = 0;
+  for (const x of transfers) if (x.mint === solMint && Number(x.tokenAmount) > 0) sol += Number(x.tokenAmount);
+  if (sol > 0) return sol;
 
-async function gmgnGetRouteExactIn({ tokenIn, tokenOut, amountInLamportsStr }) {
-  const url = new URL(`${CFG.GMGN_API}/defi/router/v1/sol/tx/get_swap_route`);
-  url.searchParams.set('token_in_address', tokenIn);
-  url.searchParams.set('token_out_address', tokenOut);
-  url.searchParams.set('in_amount', String(amountInLamportsStr));   // string
-  url.searchParams.set('from_address', WALLET_PK);
-  url.searchParams.set('slippage', String(bpsFromSlippage(CFG.MAX_SLIPPAGE)));
-  url.searchParams.set('swap_mode', 'ExactIn');
-  url.searchParams.set('fee', String(CFG.PRIORITY_FEE_SOL));        // number as string
-  if (CFG.IS_ANTI_MEV) url.searchParams.set('is_anti_mev', 'true');
-
-  const res = await fetch(url.toString());
-  const data = await res.json().catch(()=>null);
-  if (!res.ok || !data || data.code !== 0) {
-    throw new Error(`GMGN route invalid: ${JSON.stringify(data || {})} {status:${res.status}}`);
-  }
-  return data.data; // { quote, raw_tx }
+  // fallback: lamports "parsed transfer" dans instructions
+  let lamports = 0;
+  const top = payload?.transaction?.message?.instructions || [];
+  const inner = payload?.meta?.innerInstructions || [];
+  const scan = (ins) => {
+    if (ins?.parsed?.type === 'transfer' && ins?.parsed?.info?.lamports) {
+      lamports += Number(ins.parsed.info.lamports);
+    }
+  };
+  top.forEach(scan);
+  inner.forEach(g => (g.instructions || []).forEach(scan));
+  return lamports / LAMPORTS_PER_SOL;
 }
 
-async function gmgnSendSignedTx(base64, isAnti=false) {
-  const res = await fetch(`${CFG.GMGN_API}/txproxy/v1/send_transaction`, {
-    method: 'POST',
-    headers: {'content-type':'application/json'},
-    body: JSON.stringify({ chain:'sol', signedTx: base64, isAntiMev: !!isAnti }),
-  });
-  const data = await res.json().catch(()=>null);
-  if (!res.ok || !data || data.code !== 0) {
-    throw new Error(`GMGN send err: ${JSON.stringify(data || {})} {status:${res.status}}`);
-  }
-  return data.data; // { hash, resArr: [...] }
-}
-
-async function gmgnPollStatus(hash, lastValidBlockHeight) {
-  // loop until success or expired
-  const url = new URL(`${CFG.GMGN_API}/defi/router/v1/sol/tx/get_transaction_status`);
-  url.searchParams.set('hash', hash);
-  url.searchParams.set('last_valid_height', String(lastValidBlockHeight));
-
-  while (true) {
-    const r = await fetch(url.toString());
-    const j = await r.json().catch(()=>null);
-    const st = j?.data || {};
-    dbg('[status] {', JSON.stringify(st), '}');
-    if (st.success === true || st.expired === true || st.failed === true) return st;
-    await sleep(500);
-  }
-}
-
-async function gmgnSwapExactIn({ tokenIn, tokenOut, amountInLamportsStr }) {
-  // fetch route
-  const route = await gmgnGetRouteExactIn({ tokenIn, tokenOut, amountInLamportsStr });
-  const swapTxBuf = Buffer.from(route.raw_tx.swapTransaction, 'base64');
-  const vtx = VersionedTransaction.deserialize(swapTxBuf);
-  vtx.sign([wallet]);
-  const signedB64 = Buffer.from(vtx.serialize()).toString('base64');
-
-  info(`[GMGN] …pending  hash=${route.raw_tx.recentBlockhash}  lvh=${route.raw_tx.lastValidBlockHeight}`);
-  const sent = await gmgnSendSignedTx(signedB64, CFG.IS_ANTI_MEV);
-  const status = await gmgnPollStatus(sent.hash, route.raw_tx.lastValidBlockHeight);
-
-  return { hash: sent.hash, status };
-}
-
-// ====================== Token helpers (balance/decimals) ======================
-async function getTokenBalanceLamportsStr(mintStr) {
-  const mint = new PublicKey(mintStr);
-  // compte associé (ATA) parsé => balance.amount (string, déjà en base units)
-  const accs = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, { mint });
-  if (!accs.value.length) return { amount: '0', decimals: 0 };
-  const parsed = accs.value[0].account.data.parsed.info.tokenAmount;
-  // parsed = { amount: '123456', decimals: 6, uiAmount: 0.123456 ... }
-  return { amount: String(parsed.amount || '0'), decimals: Number(parsed.decimals || 0) };
-}
-function pctLamports(amountStr, pct) {
-  // amountStr is string (lamports); pct in [0..1]
-  const A = BigInt(amountStr);
-  const N = BigInt(Math.round(pct * 1_000_000)); // 1e-6 precision
-  return (A * N) / 1_000_000n;
-}
-
-// ====================== Aide extraction (payload Helius) ======================
 function extractMint(payload) {
-  // essaye d'abord format "enhanced"
+  // essaie via accountData.tokenBalanceChanges deltas +
   const acc = payload?.accountData || [];
   const deltas = new Map();
   for (const a of acc) {
     for (const t of (a.tokenBalanceChanges || [])) {
       const mint = t.mint;
-      const raw = Number(t.rawTokenAmount?.tokenAmount || 0);
-      if (raw > 0) deltas.set(mint, (deltas.get(mint) || 0) + raw / (10 ** (t.rawTokenAmount?.decimals ?? 9)));
+      const raw  = Number(t.rawTokenAmount?.tokenAmount || 0);
+      const dec  = Number(t.rawTokenAmount?.decimals ?? 9);
+      if (raw > 0) deltas.set(mint, (deltas.get(mint) || 0) + raw / (10 ** dec));
     }
   }
   if (deltas.size) return [...deltas.entries()].sort((a,b)=>b[1]-a[1])[0][0];
@@ -233,213 +127,193 @@ function extractMint(payload) {
   const cand = Object.entries(byMint).sort((a,b)=>b[1]-a[1]);
   return cand.length ? cand[0][0] : null;
 }
-function estimateSolAdded(payload) {
-  const solMint = CFG.BASE_SOL_MINT;
-  const t = payload?.tokenTransfers || [];
-  let by = 0;
-  for (const x of t) if (x.mint === solMint && x.tokenAmount > 0) by += Number(x.tokenAmount);
-  if (by > 0) return by;
-  // fallback via inner 'transfer' lamports
-  let lamports = 0;
-  const top = payload?.transaction?.message?.instructions || [];
-  const inner = payload?.meta?.innerInstructions || [];
-  const scan = (ins) => { if (ins?.parsed?.type === 'transfer' && ins?.parsed?.info?.lamports) lamports += Number(ins.parsed.info.lamports); };
-  top.forEach(scan);
-  inner.forEach(g => (g.instructions || []).forEach(scan));
-  return lamports / LAMPORTS_PER_SOL;
+
+// -------------------- GMGN helpers --------------------
+async function gmgnGetRoute({ tokenIn, tokenOut, inLamports, fromAddress, slippagePct, feeSol }) {
+  const url = new URL(`${CFG.GMGN_HOST}/defi/router/v1/sol/tx/get_swap_route`);
+  url.searchParams.set('token_in_address', tokenIn);
+  url.searchParams.set('token_out_address', tokenOut);
+  url.searchParams.set('in_amount', String(inLamports)); // lamports du token IN
+  url.searchParams.set('from_address', fromAddress);
+  url.searchParams.set('slippage', String(slippagePct * 100)); // API accepte 10 pour 10% —> on met 0.30 => 30
+  url.searchParams.set('fee', String(feeSol));               // en SOL
+  // swap_mode = ExactIn par défaut
+
+  const res = await fetch(url.toString(), { method: 'GET' });
+  const data = await res.json().catch(()=>null);
+  if (!data || data.code !== 0 || !data.data?.raw_tx?.swapTransaction) {
+    throw new Error(`GMGN route invalid: ${JSON.stringify(data)} {status:${res.status}}`);
+  }
+  return data.data; // { quote, raw_tx:{swapTransaction,...} }
 }
 
-// ====================== Strategy State & Loop ======================
-let position = null; // { mint, entry, high, remainingPct, startedAt }
+async function gmgnSendSigned(base64Signed) {
+  const res = await fetch(`${CFG.GMGN_HOST}/txproxy/v1/send_transaction`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ chain: 'sol', signedTx: base64Signed }),
+  });
+  const data = await res.json().catch(()=>null);
+  if (!data || data.code !== 0 || !data.data?.hash) {
+    throw new Error(`GMGN submit failed: ${JSON.stringify(data)} {status:${res.status}}`);
+  }
+  return data.data; // {hash, resArr:[...]}
+}
 
-const trailStopPrice = (p) => p.high * (1 - CFG.TRAIL_GAP);
+async function signAndSubmitFromRoute(routeRawTxB64) {
+  const buf = Buffer.from(routeRawTxB64, 'base64');
+  const vtx = VersionedTransaction.deserialize(buf);
+  vtx.sign([wallet]);
+  const signedB64 = Buffer.from(vtx.serialize()).toString('base64');
+  const sub = await gmgnSendSigned(signedB64);
+  return sub.hash;
+}
 
-async function gmgnBuySOLtoToken(mint) {
-  const amountLamports = Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL);
-  const { hash, status } = await gmgnSwapExactIn({
+// -------------------- SELL helpers --------------------
+async function getTokenBalanceLamports(ownerPk, mintPk) {
+  const owner = new PublicKey(ownerPk);
+  const mint  = new PublicKey(mintPk);
+  const resp = await connection.getParsedTokenAccountsByOwner(owner, { mint });
+  let ui = 0, dec = 0;
+  for (const { account } of resp.value) {
+    const info = account.data?.parsed?.info;
+    const amt  = Number(info?.tokenAmount?.amount || 0); // en "smallest units"
+    const d    = Number(info?.tokenAmount?.decimals || 0);
+    ui += amt;
+    dec = d; // supposons mêmes décimales
+  }
+  return { amountLamports: ui, decimals: dec };
+}
+
+// -------------------- Buy / Sell core --------------------
+async function buyViaGMGN(mint) {
+  const inLamports = Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL);
+  const slippage   = CFG.MAX_SLIPPAGE;     // 0.30 -> 30
+  const feeSol     = CFG.PRIORITY_FEE_SOL; // ex 0.006
+
+  const data = await gmgnGetRoute({
     tokenIn: CFG.BASE_SOL_MINT,
     tokenOut: mint,
-    amountInLamportsStr: String(amountLamports),
+    inLamports,
+    fromAddress: WALLET_PK,
+    slippagePct: slippage,
+    feeSol,
   });
+
+  const hash = await signAndSubmitFromRoute(data.raw_tx.swapTransaction);
   info(`🟢 [BUY GMGN] hash=${hash}`);
-  if (status.success) info(`[BUY] ✅ confirmed`);
-  else if (status.expired) warn(`[BUY] ⏳ expired (likely not landed)`);
-  else if (status.failed) warn(`[BUY] ❌ failed`);
+  return { hash, lastValidBlockHeight: data.raw_tx.lastValidBlockHeight };
 }
 
-async function gmgnSellTokenToSOL_pct(mint, pct) {
-  // lecture balance (lamports déjà), calc % en BigInt
-  const { amount } = await getTokenBalanceLamportsStr(mint);
-  if (amount === '0') { warn('sell: no balance'); return; }
-
-  let want = pctLamports(amount, pct);
-  if (want <= 0n) { warn('sell: amount <= 0'); return; }
-
-  // retry avec réduction si route échoue (little pool hit / 400…)
-  let chunk = want;
-  let tries = 0;
-  const minUnit = 1n;
-
-  while (chunk > 0n && tries < 5) {
-    try {
-      const { hash, status } = await gmgnSwapExactIn({
-        tokenIn: mint,
-        tokenOut: CFG.BASE_SOL_MINT,
-        amountInLamportsStr: chunk.toString(),
-      });
-      info(`🔴 [SELL GMGN] hash=${hash}`);
-      if (status.success) { info(`[SELL] ✅ confirmed`); return; }
-      if (status.expired) { warn(`[SELL] ⏳ expired — resubmit later`); return; }
-      if (status.failed) { warn(`[SELL] ❌ failed`); return; }
-      return;
-    } catch (e) {
-      tries++;
-      const msg = String(e.message || '');
-      warn(`sell route err (${tries}/5): ${msg}`);
-      // réduction du chunk si route invalide
-      chunk = (chunk * 3n) / 5n; // 60%
-      if (chunk < minUnit) { warn('sell: chunk < 1, abort'); break; }
-      await sleep(200);
-    }
+async function sellAllViaGMGN(mint) {
+  const { amountLamports } = await getTokenBalanceLamports(WALLET_PK, mint);
+  if (!amountLamports || amountLamports <= 0) {
+    warn(`sellAll: aucun solde token à vendre (mint=${mint})`);
+    return null;
   }
+  const slippage = CFG.MAX_SLIPPAGE;
+  const feeSol   = CFG.PRIORITY_FEE_SOL;
+
+  const data = await gmgnGetRoute({
+    tokenIn: mint,
+    tokenOut: CFG.BASE_SOL_MINT,
+    inLamports: amountLamports, // tout le solde token en "smallest units"
+    fromAddress: WALLET_PK,
+    slippagePct: slippage,
+    feeSol,
+  });
+
+  const hash = await signAndSubmitFromRoute(data.raw_tx.swapTransaction);
+  info(`🔴 [SELL GMGN] hash=${hash}`);
+  return { hash, lastValidBlockHeight: data.raw_tx.lastValidBlockHeight };
 }
 
-// wrappers de stratégie
-async function liveSellPct(pct) {
-  if (!position || pct <= 0) return;
-  await gmgnSellTokenToSOL_pct(position.mint, pct);
-  const soldPct = Math.min(position.remainingPct, pct);
-  position.remainingPct -= soldPct;
-  csv({ event:'exit', side:'SELL', token:position.mint, extra:`pct=${pct}` });
-  if (position.remainingPct <= 0.000001) position = null;
-}
-
-async function managePositionLoop() {
-  while (position) {
-    const px = await spotPriceFast(position.mint).catch(()=>null) || position.entry;
-    if (px > position.high) position.high = px;
-
-    const up = px / position.entry - 1;
-    const down = 1 - px / position.entry;
-
-    // TP1
-    if (position.remainingPct > 0.99 && up >= CFG.TP1_PCT) {
-      await liveSellPct(CFG.TP1_SELL);
-      position && (position.remainingPct = Math.max(0, position.remainingPct));
-    }
-
-    // Trailing (sur le reste)
-    if (position && position.remainingPct <= 0.30) {
-      const tstop = trailStopPrice(position);
-      if (px <= tstop) { await liveSellPct(1.0); break; }
-    }
-
-    // Hard SL
-    if (down >= CFG.HARD_SL) { await liveSellPct(1.0); break; }
-
-    await sleep(150);
-  }
-}
-
-// ====================== BUY ======================
-async function liveBuy(mint) {
-  // Essaye d’estimer le px d’entrée via Jupiter (quote only)
-  let entryGuess = 0.000001;
-  try {
-    const q = await jupQuote({
-      inputMint: CFG.BASE_SOL_MINT,
-      outputMint: mint,
-      amountLamports: Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL),
-      slippageBps: Math.floor(CFG.MAX_SLIPPAGE * 10000),
-    });
-    const px = priceFromQuote(q);
-    if (px) entryGuess = px * (1 + 0.5 * CFG.MAX_SLIPPAGE); // conservative fill
-  } catch {}
-
-  await gmgnBuySOLtoToken(mint);
-  position = {
-    mint,
-    entry: entryGuess,
-    high: entryGuess,
-    remainingPct: 1.0,
-    startedAt: Date.now(),
-  };
-
-  info(`🟢 [ENTER/gmgn] ${mint}  fill~${fmt(entryGuess)} SOL/tok`);
-  csv({ event:'enter', side:'BUY', price:entryGuess, sol:CFG.TRADE_SIZE_SOL, token:mint });
-
-  // start management
-  managePositionLoop().catch(()=>{});
-
-  // timeout total (optionnel)
-  if (CFG.EXIT_TIMEOUT_MS > 0) {
-    setTimeout(async () => {
-      if (position && position.mint === mint) {
-        info(`⏳ Timeout ${CFG.EXIT_TIMEOUT_MS}ms => sortie totale`);
-        await liveSellPct(1.0);
-      }
-    }, CFG.EXIT_TIMEOUT_MS);
-  }
-}
-
-// ====================== Webhook ======================
+// -------------------- Webhook & core logic --------------------
 const app = express();
 app.use(bodyParser.json({ limit: '20mb' }));
 
-const seenMint = new Map(); // anti-refire 30s
+const seenMintTs = new Map(); // anti-refire 30s
 
 app.post('/helius-webhook', async (req, res) => {
   try {
     const payload = Array.isArray(req.body) ? req.body[0] : req.body;
     const t = payload?.type || 'UNKNOWN';
-    const src = payload?.source || 'unknown';
-
-    if (!['CREATE_POOL','ADD_LIQUIDITY'].includes(t)) {
-      dbg(`skip: ignored-type (${t})`);
+    if (t !== 'CREATE_POOL') { // strictement CREATE_POOL comme demandé
       return res.status(200).send({ ok:true, note:'ignored-type', type:t });
     }
 
     const mint = extractMint(payload);
-    if (!mint) { warn('skip: no-mint'); return res.status(200).send({ ok:true, note:'no-mint' }); }
+    if (!mint) {
+      warn('skip: no-mint');
+      return res.status(200).send({ ok:true, note:'no-mint' });
+    }
 
+    // âge du pool
+    const evMs = eventUnixMs(payload);
+    const age  = nowMs() - evMs;
+
+    // SOL ajoutés
     const added = estimateSolAdded(payload);
-    info(`🚀 Nouveau token: ${mint} | type=${t} src=${src} | ~${fmt(added)} SOL ajoutés`);
-    csv({ event:'detect', price:'', sol:added, token:mint, extra:`type=${t}|source=${src}` });
 
+    info(`🚀 Nouveau token: ${mint} | age=${age}ms | added≈${fmt6(added)} SOL | type=${t}`);
+
+    if (age > CFG.MAX_POOL_AGE_MS) {
+      dbg(`skip: too-old (${age}ms > ${CFG.MAX_POOL_AGE_MS})`);
+      return res.status(200).send({ ok:true, note:'too-old', age });
+    }
     if (added < CFG.TRIGGER_MIN_SOL) {
-      dbg(`skip: below-threshold (${fmt(added)} < ${CFG.TRIGGER_MIN_SOL})`);
+      dbg(`skip: below-threshold (${fmt6(added)} < ${CFG.TRIGGER_MIN_SOL})`);
       return res.status(200).send({ ok:true, note:'below-threshold', added });
     }
 
-    const now = Date.now();
-    if (seenMint.get(mint) && now - seenMint.get(mint) < 30000) {
+    // anti-refire 30s
+    const now = nowMs();
+    if (seenMintTs.get(mint) && now - seenMintTs.get(mint) < 30000) {
       return res.status(200).send({ ok:true, note:'cooldown' });
     }
-    seenMint.set(mint, now);
+    seenMintTs.set(mint, now);
 
+    // BUY
+    let buyHash = null;
     try {
-      await liveBuy(mint);
-      return res.status(200).send({ ok:true, triggered:true, mint, added });
+      const buy = await buyViaGMGN(mint);
+      buyHash = buy?.hash || null;
+      info(`[BUY] …pending`);
     } catch (e) {
       err('Buy failed:', e.message);
       return res.status(200).send({ ok:true, note:'buy-failed', err:e.message });
     }
+
+    // schedule EXIT by timeout
+    if (CFG.EXIT_TIMEOUT_MS > 0) {
+      setTimeout(async () => {
+        try {
+          await sellAllViaGMGN(mint);
+          info(`[EXIT] Timeout ${CFG.EXIT_TIMEOUT_MS}ms => sortie totale déclenchée`);
+        } catch (e) {
+          err('Sell (timeout) failed:', e.message);
+        }
+      }, CFG.EXIT_TIMEOUT_MS);
+    }
+
+    return res.status(200).send({ ok:true, triggered:true, mint, age, added, buyHash });
   } catch (e) {
     err('webhook error:', e);
-    return res.status(500).send({ ok:false, error: e.message });
+    return res.status(500).send({ ok:false, error:e.message });
   }
 });
 
 app.get('/health', (_req, res) => res.send({
   ok: true,
-  mode: CFG.MODE,
   wallet: WALLET_PK,
+  rpc: CFG.RPC_URL,
   triggerMinSol: CFG.TRIGGER_MIN_SOL,
-  tp1: { pct: CFG.TP1_PCT, sell: CFG.TP1_SELL },
-  trail: CFG.TRAIL_GAP,
-  hardSL: CFG.HARD_SL,
-  timeoutMs: CFG.EXIT_TIMEOUT_MS,
-  gmgn: { api: CFG.GMGN_API, fee: CFG.PRIORITY_FEE_SOL, antiMev: CFG.IS_ANTI_MEV },
+  maxPoolAgeMs: CFG.MAX_POOL_AGE_MS,
+  tradeSizeSOL: CFG.TRADE_SIZE_SOL,
+  maxSlippage: CFG.MAX_SLIPPAGE,
+  priorityFeeSOL: CFG.PRIORITY_FEE_SOL,
+  exitTimeoutMs: CFG.EXIT_TIMEOUT_MS,
+  gmgnHost: CFG.GMGN_HOST,
 }));
 
 app.listen(CFG.PORT, () => {
