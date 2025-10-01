@@ -1,8 +1,8 @@
 /**
- * GMGN Sniper — Entrée ultra-rapide + garde-fous + rug-guard + sortie timeout
- * - Webhook Helius: CREATE_POOL / ADD_LIQUIDITY
- * - Route & TX: GMGN Router (sign local, submit via GMGN txproxy)
- * - AUCUN TP/SL : sortie totale au timeout
+ * snipe_bot_ws_raw_gmgn.js
+ * GMGN Sniper — WebSocket (logs) + raw webhook + GMGN route txproxy
+ * - garde-fous route, rug-guard, timeout exit
+ * - logs améliorés, CSV
  */
 
 import 'dotenv/config';
@@ -21,55 +21,44 @@ import {
 
 // ====================== Config ======================
 const CFG = {
-  // Serveur
   PORT: Number(process.env.PORT || 10000),
-
-  // RPC local (pour lire soldes & ALT)
   RPC_URL: process.env.RPC_URL || 'https://api.mainnet-beta.solana.com',
 
-  // Filtres d'entrée
   MAX_POOL_AGE_MS: Number(process.env.MAX_POOL_AGE_MS || 2500),
-  TRIGGER_MIN_SOL: Number(process.env.TRIGGER_MIN_SOL || 200),        // seuil par défaut
-  PUMP_TRIGGER_MIN_SOL: Number(process.env.PUMP_TRIGGER_MIN_SOL || 350), // seuil plus élevé si source === PUMP_AMM
+  TRIGGER_MIN_SOL: Number(process.env.TRIGGER_MIN_SOL || 200),
+  PUMP_TRIGGER_MIN_SOL: Number(process.env.PUMP_TRIGGER_MIN_SOL || 350),
 
-  // Trade
   TRADE_SIZE_SOL: Number(process.env.TRADE_SIZE_SOL || 0.20),
-  MAX_SLIPPAGE: Number(process.env.MAX_SLIPPAGE || 0.30), // 30% => 30
+  MAX_SLIPPAGE: Number(process.env.MAX_SLIPPAGE || 0.30),
   PRIORITY_FEE_SOL: Number(process.env.PRIORITY_FEE_SOL || 0.006),
   ANTI_MEV: ['1','true','yes'].includes(String(process.env.ANTI_MEV || '').toLowerCase()),
 
-  // Sortie
   EXIT_TIMEOUT_MS: Number(process.env.EXIT_TIMEOUT_MS || 15000),
 
-  // Garde-fous route (GMGN)
-  MAX_PRICE_IMPACT_PCT: Number(process.env.MAX_PRICE_IMPACT_PCT || 22),  // ex: 22%
-  MIN_OTHER_OVER_OUT: Number(process.env.MIN_OTHER_OVER_OUT || 0.965),    // otherAmountThreshold / outAmount
-  MIN_OUT_PER_SOL: Number(process.env.MIN_OUT_PER_SOL || 0),              // 0 pour désactiver
+  MAX_PRICE_IMPACT_PCT: Number(process.env.MAX_PRICE_IMPACT_PCT || 22),
+  MIN_OTHER_OVER_OUT: Number(process.env.MIN_OTHER_OVER_OUT || 0.965),
+  MIN_OUT_PER_SOL: Number(process.env.MIN_OUT_PER_SOL || 0),
 
-  // Rug-guard post-entrée
   RUG_GUARD_WINDOW_MS: Number(process.env.RUG_GUARD_WINDOW_MS || 2000),
-  RUG_DROP_PCT: Number(process.env.RUG_DROP_PCT || 30), // (-30%) si tu compares un ratio d'entrée
+  RUG_DROP_PCT: Number(process.env.RUG_DROP_PCT || 30),
 
-  // GMGN
   GMGN_HOST: process.env.GMGN_HOST || 'https://gmgn.ai',
 
-  // Wallet
-  WALLET_SECRET_KEY: process.env.WALLET_SECRET_KEY || '', // base58
-
-  // Mint SOL
+  WALLET_SECRET_KEY: process.env.WALLET_SECRET_KEY || '',
   BASE_SOL_MINT: 'So11111111111111111111111111111111111111112',
 
-  // Divers
   CSV_FILE: process.env.CSV_FILE || 'live_trades.csv',
   LOG_LEVEL: (process.env.LOG_LEVEL || 'info').toLowerCase(),
 };
 
+// ====================== Logger ======================
 const dbg  = (...a) => { if (CFG.LOG_LEVEL === 'debug') console.log(...a); };
 const info = (...a) => console.log(...a);
 const warn = (...a) => console.warn(...a);
 const err  = (...a) => console.error(...a);
 
 if (!CFG.WALLET_SECRET_KEY) { err('❌ WALLET_SECRET_KEY manquant'); process.exit(1); }
+if (!CFG.GMGN_HOST) { err('❌ GMGN_HOST manquant'); process.exit(1); }
 
 if (!fs.existsSync(CFG.CSV_FILE)) fs.writeFileSync(CFG.CSV_FILE, 'time,event,side,sol,token,extra\n');
 const csv = (r) => {
@@ -82,12 +71,11 @@ const connection = new Connection(CFG.RPC_URL, { commitment: 'processed' });
 const wallet = Keypair.fromSecretKey(bs58.decode(CFG.WALLET_SECRET_KEY));
 const WALLET_PK = wallet.publicKey.toBase58();
 
-// ====================== Utils ======================
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const fmt = (n, d=6) => Number(n).toFixed(d);
+const fmt = (n, d=6) => (typeof n === 'number' ? Number(n).toFixed(d) : n);
 
+// ====================== Helpers extraction ======================
 function tsFromPayloadMs(payload) {
-  // Helius envoie généralement blockTime/timestamp en secondes
   const t = payload?.timestamp ?? payload?.blockTime;
   if (!t) return null;
   return Number(t) * 1000;
@@ -97,31 +85,26 @@ function poolAgeMs(payload) {
   if (!t) return null;
   return Date.now() - t;
 }
-
 function estimateSolAdded(payload) {
-  // Approx simple
   const solMint = CFG.BASE_SOL_MINT;
   const t = payload?.tokenTransfers || [];
   let by = 0;
   for (const x of t) if (x.mint === solMint && x.tokenAmount > 0) by += Number(x.tokenAmount);
   if (by > 0) return by;
-  // fallback
+  // fallback balances
   const pre = payload?.meta?.preBalances || [];
   const post = payload?.meta?.postBalances || [];
   if (pre.length && post.length) {
     let delta = 0;
     for (let i=0;i<post.length;i++) {
       const diff = (post[i] - (pre[i]||0));
-      // lamports transf ?
       if (diff > 0) delta += diff / LAMPORTS_PER_SOL;
     }
     if (delta > 0) return delta;
   }
   return 0;
 }
-
 function extractMint(payload) {
-  // Essaie token le plus crédité
   const acc = payload?.accountData || [];
   const deltas = new Map();
   for (const a of acc) {
@@ -148,16 +131,31 @@ function extractMint(payload) {
   return cand.length ? cand[0][0] : null;
 }
 
-// ====================== GMGN helpers ======================
-async function gmgnGetRoute({
-  tokenIn, tokenOut, inLamports, fromAddress, slippagePct, feeSol, isAntiMev=false,
-}) {
+function collectProgramsFromTxPayload(payload) {
+  const seen = new Set();
+  const keys = payload?.transaction?.message?.accountKeys || [];
+  if (payload?.programId) seen.add(String(payload.programId));
+  for (const ins of (payload?.transaction?.message?.instructions || [])) {
+    if (ins.programId) seen.add(String(ins.programId));
+    if (ins.programIdIndex !== undefined && keys[ins.programIdIndex]) seen.add(String(keys[ins.programIdIndex]));
+  }
+  for (const grp of (payload?.meta?.innerInstructions || [])) {
+    for (const ins of (grp.instructions || [])) {
+      if (ins.programId) seen.add(String(ins.programId));
+      if (ins.programIdIndex !== undefined && keys[ins.programIdIndex]) seen.add(String(keys[ins.programIdIndex]));
+    }
+  }
+  return [...seen];
+}
+
+// ====================== GMGN helpers (route & submit) ======================
+async function gmgnGetRoute({ tokenIn, tokenOut, inLamports, fromAddress, slippagePct, feeSol, isAntiMev=false }) {
   const params = new URLSearchParams({
     token_in_address: tokenIn,
     token_out_address: tokenOut,
     in_amount: String(inLamports),
     from_address: fromAddress,
-    slippage: String(slippagePct * 100), // GMGN attend un pourcentage, ex: 10 pour 10%
+    slippage: String(slippagePct * 100),
     swap_mode: 'ExactIn',
   });
   if (feeSol && feeSol > 0) params.set('fee', String(feeSol));
@@ -166,29 +164,26 @@ async function gmgnGetRoute({
   const url = `${CFG.GMGN_HOST}/defi/router/v1/sol/tx/get_swap_route?${params.toString()}`;
   const res = await fetch(url);
   const data = await res.json().catch(()=> ({}));
-
   if (!res.ok || !data || data.code !== 0 || !data.data?.raw_tx?.swapTransaction) {
     throw new Error(`GMGN route invalid: ${JSON.stringify(data)} {status:${res.status}}`);
   }
-  return data.data; // {quote, raw_tx:{swapTransaction,lastValidBlockHeight,recentBlockhash,...}}
+  return data.data;
 }
 
-async function gmgnSubmitSignedTx(base64Tx, isAntiMev=false) {
-  const body = { chain: 'sol', signedTx: base64Tx };
+async function gmgnSubmitSignedTx(base64Signed, isAntiMev=false) {
+  const body = { chain: 'sol', signedTx: base64Signed };
   if (isAntiMev) body.isAntiMev = true;
-
   const res = await fetch(`${CFG.GMGN_HOST}/txproxy/v1/send_transaction`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type':'application/json' },
     body: JSON.stringify(body),
   });
   const data = await res.json().catch(()=> ({}));
   if (!res.ok || data.code !== 0) {
     throw new Error(`GMGN submit error: ${JSON.stringify(data)} {status:${res.status}}`);
   }
-  return data.data; // { hash, resArr:[{hash,err:null}, ...] }
+  return data.data;
 }
-
 async function gmgnCheckStatus({ hash, lastValidBlockHeight }) {
   const url = `${CFG.GMGN_HOST}/defi/router/v1/sol/tx/get_transaction_status?hash=${hash}&last_valid_height=${lastValidBlockHeight}`;
   const res = await fetch(url);
@@ -196,9 +191,8 @@ async function gmgnCheckStatus({ hash, lastValidBlockHeight }) {
   if (!res.ok || data.code !== 0) {
     throw new Error(`GMGN status error: ${JSON.stringify(data)} {status:${res.status}}`);
   }
-  return data.data; // { success, failed, expired }
+  return data.data;
 }
-
 function ratioOutOverIn(quote) {
   const out = Number(quote?.outAmount || 0);
   const inp = Number(quote?.inAmount || 0);
@@ -206,10 +200,10 @@ function ratioOutOverIn(quote) {
   return out / inp;
 }
 
-// ====================== Guards (route + rug) ======================
+// ====================== Guards ======================
 function assertRouteGuards(routeData) {
   const q = routeData.quote || {};
-  const impactPct = Number(q?.priceImpactPct || 0) * 100; // 0.18 -> 18%
+  const impactPct = Number(q?.priceImpactPct || 0) * 100;
   const out = Number(q?.outAmount || 0);
   const other = Number(q?.otherAmountThreshold || 0);
 
@@ -230,11 +224,9 @@ function assertRouteGuards(routeData) {
   }
 }
 
-// ====================== BUY / SELL via GMGN ======================
+// ====================== BUY / SELL ======================
 async function buyViaGMGN(mint) {
   const inLamports = Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL);
-
-  // 1) route (SOL -> TOKEN)
   const route = await gmgnGetRoute({
     tokenIn: CFG.BASE_SOL_MINT,
     tokenOut: mint,
@@ -245,35 +237,31 @@ async function buyViaGMGN(mint) {
     isAntiMev: CFG.ANTI_MEV,
   });
 
-  // 2) garde-fous route
   assertRouteGuards(route);
 
-  // 3) signer & submit
   const unsigned = Buffer.from(route.raw_tx.swapTransaction, 'base64');
   const tx = VersionedTransaction.deserialize(unsigned);
   tx.sign([wallet]);
   const signed = Buffer.from(tx.serialize()).toString('base64');
 
   const submit = await gmgnSubmitSignedTx(signed, CFG.ANTI_MEV);
-  info(`[BUY] …pending  hash=${submit.hash}`);
+
+  info(`[BUY] sent GMGN hash=${submit.hash} fill~${fmt(ratioOutOverIn(route.quote),6)} out/in`);
   csv({ event:'enter', side:'BUY', sol:CFG.TRADE_SIZE_SOL, token:mint, extra:`hash=${submit.hash}` });
 
-  // 4) poll rapide (non bloquant ici)
+  // async poll
   (async () => {
     try {
       const maxMs = 8000;
       const t0 = Date.now();
       while (Date.now() - t0 < maxMs) {
-        const st = await gmgnCheckStatus({
-          hash: submit.hash,
-          lastValidBlockHeight: route.raw_tx.lastValidBlockHeight,
-        });
+        const st = await gmgnCheckStatus({ hash: submit.hash, lastValidBlockHeight: route.raw_tx.lastValidBlockHeight });
         dbg('[status]', JSON.stringify(st));
         if (st.success) { info('[BUY] ✅ confirmed'); return; }
         if (st.expired || st.failed) { warn('[BUY] ❌ not confirmed (expired/failed)'); return; }
         await sleep(350);
       }
-      warn(`Timeout ${maxMs}ms => pas de confirmation`);
+      warn(`BUY status timeout ${maxMs}ms`);
     } catch(e) { warn('status error:', e.message); }
   })();
 
@@ -294,7 +282,6 @@ async function getTokenBalanceLamports(owner, mint) {
 }
 
 async function sellAllViaGMGN(mint) {
-  // quantité à vendre = solde en "lamports du token"
   const amountIn = await getTokenBalanceLamports(WALLET_PK, mint);
   if (amountIn <= 0) { warn('[SELL] skip: no token balance'); return null; }
 
@@ -308,16 +295,13 @@ async function sellAllViaGMGN(mint) {
     isAntiMev: CFG.ANTI_MEV,
   });
 
-  // On peut appliquer les mêmes garde-fous si tu veux être prudent à la sortie (optionnel)
-  // assertRouteGuards(route);
-
   const unsigned = Buffer.from(route.raw_tx.swapTransaction, 'base64');
   const tx = VersionedTransaction.deserialize(unsigned);
   tx.sign([wallet]);
   const signed = Buffer.from(tx.serialize()).toString('base64');
 
   const submit = await gmgnSubmitSignedTx(signed, CFG.ANTI_MEV);
-  info(`[SELL] …pending  hash=${submit.hash}`);
+  info(`[SELL] sent GMGN hash=${submit.hash}`);
   csv({ event:'exit', side:'SELL', sol:'', token:mint, extra:`hash=${submit.hash}` });
 
   (async () => {
@@ -325,10 +309,7 @@ async function sellAllViaGMGN(mint) {
       const maxMs = 8000;
       const t0 = Date.now();
       while (Date.now() - t0 < maxMs) {
-        const st = await gmgnCheckStatus({
-          hash: submit.hash,
-          lastValidBlockHeight: route.raw_tx.lastValidBlockHeight,
-        });
+        const st = await gmgnCheckStatus({ hash: submit.hash, lastValidBlockHeight: route.raw_tx.lastValidBlockHeight });
         if (st.success) { info('[SELL] ✅ confirmed'); return; }
         if (st.expired || st.failed) { warn('[SELL] ❌ not confirmed (expired/failed)'); return; }
         await sleep(350);
@@ -343,10 +324,8 @@ async function sellAllViaGMGN(mint) {
 // ====================== RUG GUARD ======================
 async function rugGuardAfterBuy({ mint, entryRatio }) {
   if (CFG.RUG_GUARD_WINDOW_MS <= 0) return;
-
   const t0 = Date.now();
-  const probeIn = Math.max(1, Math.floor(0.01 * LAMPORTS_PER_SOL)); // 0.01 SOL
-
+  const probeIn = Math.max(1, Math.floor(0.01 * LAMPORTS_PER_SOL));
   while (Date.now() - t0 < CFG.RUG_GUARD_WINDOW_MS) {
     try {
       const probe = await gmgnGetRoute({
@@ -360,99 +339,181 @@ async function rugGuardAfterBuy({ mint, entryRatio }) {
       });
       const imp = Number(probe.quote?.priceImpactPct || 0) * 100;
       const ratio = ratioOutOverIn(probe.quote);
-      // Drop relatif vs entrée (si on a une ratio d'entrée)
       if (entryRatio > 0) {
         const dropPct = (1 - (ratio / entryRatio)) * 100;
         if (dropPct >= CFG.RUG_DROP_PCT) {
-          warn(`[RUG-GUARD] price drop ~${dropPct.toFixed(1)}% ≥ ${CFG.RUG_DROP_PCT}% => SELL NOW`);
+          warn(`[RUG-GUARD] drop ${dropPct.toFixed(1)}% ≥ ${CFG.RUG_DROP_PCT}% => SELL NOW`);
           await sellAllViaGMGN(mint);
           return;
         }
       }
-      // Impact énorme (coupe-circuit)
       if (imp > Math.max(45, CFG.MAX_PRICE_IMPACT_PCT + 20)) {
         warn(`[RUG-GUARD] impact ${imp.toFixed(1)}% => SELL NOW`);
         await sellAllViaGMGN(mint);
         return;
       }
     } catch(e) {
-      // Si la route échoue, c'est possiblement rug → tente sell quand même avec une petite pause
-      warn('[RUG-GUARD] probe error:', e.message);
+      warn('[RUG-GUARD] probe error (possible rug):', e.message);
     }
     await sleep(250);
   }
 }
 
-// ====================== Webhook server ======================
-const app = express();
-app.use(bodyParser.json({ limit: '20mb' }));
-
+// ====================== unified detector handler ======================
 const seenMint = new Map(); // anti-refire 30s
 
-app.post('/helius-webhook', async (req, res) => {
+async function handleDetected(payload, srcHint = 'unknown', extra = {}) {
   try {
-    const payload = Array.isArray(req.body) ? req.body[0] : req.body;
     const t = payload?.type || 'UNKNOWN';
-    const src = payload?.source || 'unknown';
-
-    if (!['CREATE_POOL','ADD_LIQUIDITY'].includes(t)) {
-      dbg(`skip: ignored-type (${t})`);
-      return res.status(200).send({ ok:true, note:'ignored-type', type:t });
-    }
-
+    const src = payload?.source || srcHint || 'unknown';
     const mint = extractMint(payload);
     const added = estimateSolAdded(payload);
     const age = poolAgeMs(payload);
+
+    if (!mint) { dbg('skip: no mint extracted'); return { ok:false, reason:'no-mint' }; }
+
     const ageTxt = (age==null) ? 'n/a' : `${age}ms`;
+    info(`🚀 Nouveau token: ${mint} | type=${t} src=${src} | added≈${fmt(added,6)} SOL | age=${ageTxt} ${extra.signature ? 'sig='+extra.signature : ''}`);
 
-    // 👉 logs de source
-    info(`🚀 Nouveau token: ${mint} | type=${t} src=${src} | added≈${fmt(added,6)} SOL | age=${ageTxt}`);
-
-    // Seuils dynamiques selon la source
     const minSol = (src === 'PUMP_AMM') ? CFG.PUMP_TRIGGER_MIN_SOL : CFG.TRIGGER_MIN_SOL;
 
-    // Filtres de base
     if (age != null && age > CFG.MAX_POOL_AGE_MS) {
       dbg(`skip: old pool (${age}ms > ${CFG.MAX_POOL_AGE_MS}ms)`);
-      return res.status(200).send({ ok:true, note:'old-pool', age });
+      return { ok:false, reason:'old-pool', age };
     }
     if (added < minSol) {
       dbg(`skip: below-threshold (${fmt(added)} < ${minSol})`);
-      return res.status(200).send({ ok:true, note:'below-threshold', added, minSol });
+      return { ok:false, reason:'below-threshold', added, minSol };
     }
 
-    // anti-refire 30s
     const now = Date.now();
     if (seenMint.get(mint) && now - seenMint.get(mint) < 30000) {
-      return res.status(200).send({ ok:true, note:'cooldown' });
+      dbg('skip: cooldown 30s');
+      return { ok:false, reason:'cooldown' };
     }
     seenMint.set(mint, now);
 
     // BUY
     try {
-      const { route } = await buyViaGMGN(mint);
+      const { route, hash } = await buyViaGMGN(mint);
       const entryRatio = ratioOutOverIn(route.quote) || 0;
 
-      // Mini Rug-Guard (asynchrone)
+      // async rug guard
       rugGuardAfterBuy({ mint, entryRatio }).catch(()=>{});
 
-      // Timeout de sortie
+      // Timeout exit
       if (CFG.EXIT_TIMEOUT_MS > 0) {
         setTimeout(async () => {
-          info(`⏳ Timeout ${CFG.EXIT_TIMEOUT_MS}ms => sortie totale`);
+          info(`⏳ Timeout ${CFG.EXIT_TIMEOUT_MS}ms => sortie totale for ${mint}`);
           await sellAllViaGMGN(mint);
         }, CFG.EXIT_TIMEOUT_MS);
       }
 
-      return res.status(200).send({ ok:true, triggered:true, mint, added, src, minSol, age });
+      return { ok:true, mint, hash, added, src };
     } catch (e) {
       err('Buy failed:', e.message);
-      return res.status(200).send({ ok:true, note:'buy-failed', err:e.message, src, added, age });
+      return { ok:false, reason:'buy-failed', err:e.message };
     }
 
   } catch (e) {
-    err('webhook error:', e);
-    return res.status(500).send({ ok:false, error: e.message });
+    err('handleDetected error:', e);
+    return { ok:false, reason:'internal', err:e.message };
+  }
+}
+
+// ====================== getTransaction helper w/ retries ======================
+async function fetchTransactionWithRetries(sig, attempts = 6, delay = 200) {
+  for (let i=0;i<attempts;i++) {
+    try {
+      const tx = await connection.getTransaction(sig, { commitment:'processed', maxSupportedTransactionVersion: 0 });
+      if (tx) return tx;
+    } catch(e) {
+      dbg('getTransaction err:', e.message);
+    }
+    await sleep(delay);
+  }
+  return null;
+}
+
+// ====================== WebSocket logs subscription (fast) ======================
+function startLogsListener() {
+  try {
+    // Subscription to all logs (signature-level). Using 'all' as filter uses logsSubscribe with all logs.
+    connection.onLogs('all', async (logInfo, ctx) => {
+      try {
+        // logInfo: { signature, err, logs, slot }
+        const sig = logInfo?.signature;
+        if (!sig) return;
+        dbg('logs event sig=', sig);
+
+        // Fetch tx (retry small)
+        const tx = await fetchTransactionWithRetries(sig, 6, 150);
+        if (!tx) { dbg('tx not found for sig', sig); return; }
+
+        // Build a minimal payload compatible with rest of pipeline
+        const payload = {
+          transaction: tx.transaction,
+          meta: tx.meta,
+          slot: tx.slot,
+          timestamp: tx.blockTime || null,
+        };
+
+        // try to infer source: check programs
+        const progs = collectProgramsFromTxPayload(payload);
+        let src = 'unknown';
+        // heuristics
+        if (progs.includes('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA')) src = 'PUMP_AMM';
+        if (progs.includes('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA')) src = 'SPL_TOKEN';
+        // pass signature as extra
+        await handleDetected(payload, src, { signature: sig });
+      } catch (ee) {
+        dbg('logs handler error:', ee.message);
+      }
+    }, 'processed');
+    info('WebSocket logs listener started (onLogs)');
+  } catch (e) {
+    warn('Failed to start logs listener:', e.message);
+  }
+}
+
+// ====================== Webhook (raw + enhanced) ======================
+const app = express();
+// parse raw bodies too (in case pump/helius sends signature string)
+app.use(bodyParser.json({ limit: '20mb' }));
+app.post('/helius-webhook', async (req, res) => {
+  try {
+    // If body contains signature (raw mode) => fetch transaction and process
+    if (req.body && (req.body.signature || req.body.txSig || typeof req.body === 'string')) {
+      const sig = req.body.signature || req.body.txSig || (typeof req.body === 'string' ? req.body : null);
+      info('Received raw webhook signature:', sig);
+      const tx = await fetchTransactionWithRetries(sig, 8, 200);
+      if (!tx) {
+        warn('raw webhook: transaction not found for sig', sig);
+        return res.status(200).send({ ok:true, note:'tx-not-found', sig });
+      }
+      const payload = { transaction: tx.transaction, meta: tx.meta, slot: tx.slot, timestamp: tx.blockTime || null };
+      const progs = collectProgramsFromTxPayload(payload);
+      let src = 'unknown';
+      if (progs.includes('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA')) src = 'PUMP_AMM';
+      const r = await handleDetected(payload, src, { signature: sig });
+      return res.status(200).send(r);
+    }
+
+    // Else assume enhanced webhook payload from Helius
+    const payload = Array.isArray(req.body) ? req.body[0] : req.body;
+    const t = payload?.type || 'UNKNOWN';
+    const src = payload?.source || 'unknown';
+    // quick sanity
+    if (!['CREATE_POOL','ADD_LIQUIDITY'].includes(t)) {
+      dbg(`skip: ignored-type (${t})`);
+      return res.status(200).send({ ok:true, note:'ignored-type', type:t });
+    }
+    const r = await handleDetected(payload, src, {});
+    return res.status(200).send(r);
+
+  } catch (e) {
+    err('webhook error:', e.message || e);
+    return res.status(500).send({ ok:false, error: e.message || String(e) });
   }
 });
 
@@ -468,18 +529,12 @@ app.get('/health', (_req, res) => res.send({
     priorityFeeSOL: CFG.PRIORITY_FEE_SOL,
     antiMEV: CFG.ANTI_MEV,
     exitTimeoutMs: CFG.EXIT_TIMEOUT_MS,
-    guards: {
-      maxPriceImpactPct: CFG.MAX_PRICE_IMPACT_PCT,
-      minOtherOverOut: CFG.MIN_OTHER_OVER_OUT,
-      minOutPerSol: CFG.MIN_OUT_PER_SOL,
-    },
-    rugGuard: {
-      windowMs: CFG.RUG_GUARD_WINDOW_MS,
-      dropPct: CFG.RUG_DROP_PCT,
-    },
   },
 }));
 
+// ====================== Start ======================
 app.listen(CFG.PORT, () => {
   info(`GMGN sniping listener on :${CFG.PORT} (LOG_LEVEL=${CFG.LOG_LEVEL})`);
+  // start logs listener (ws) — non bloquant
+  startLogsListener();
 });
