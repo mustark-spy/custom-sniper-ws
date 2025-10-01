@@ -70,6 +70,26 @@ const CFG = {
   RPC_BACKOFF_MS: Number(process.env.RPC_BACKOFF_MS || 600), // backoff 429
 };
 
+// base58-like, 32..44 chars
+const PK_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+function sanitizedProgramIds(list) {
+  const out = [];
+  for (const raw of list) {
+    const id = (raw || '').trim();
+    if (!id) continue;
+    if (!PK_RE.test(id)) { warn(`Invalid AMM program id in AMM_PROGRAM_IDS: "${raw}" → ignored`); continue; }
+    try {
+      // Also ensure it's a valid PublicKey
+      new PublicKey(id);
+      out.push(id);
+    } catch (e) {
+      warn(`Invalid AMM program id in AMM_PROGRAM_IDS: "${raw}" → ${e.message}`);
+    }
+  }
+  return out;
+}
+
 /* ====================== Logger ====================== */
 const dbg  = (...a) => { if (CFG.LOG_LEVEL === 'debug') console.log(...a); };
 const info = (...a) => console.log(...a);
@@ -477,57 +497,51 @@ async function getSigStatusOnce(sig) {
   );
 }
 
-async function getTx(commitment) {
-  return async (sig) => await withRpcBudget(
+async function getTransactionWith(sig, commitment) {
+  return await withRpcBudget(
     () => connection.getTransaction(sig, { commitment, maxSupportedTransactionVersion: 0 }),
     `getTransaction(${commitment})`
   );
 }
-const getTxConfirmed = getTx('confirmed');
-const getTxFinalized = getTx('finalized');
 
 /**
- * Politique "lean":
- *  1) status 1x ; si pas confirmé → petite pause ; recheck 1x
- *  2) si confirmé → getTransaction(confirmed), sinon 1 essai en finalized
+ * Lean policy:
+ *  1) status once; if not confirmed → short wait → status again
+ *  2) if confirmed → getTransaction(confirmed), else try finalized once
  */
 async function fetchTxAfterConfirmed(sig) {
-  // 1er check
   let st = await getSigStatusOnce(sig).catch(e => { errOnce('sigStatus', e.message); return null; });
   let s  = st?.value?.[0];
   if (s?.err) return null;
 
   if (!s || (s.confirmationStatus !== 'confirmed' && s.confirmationStatus !== 'finalized' && (s.confirmations ?? 0) < 1)) {
-    await sleep(200); // petite attente
+    await sleep(200);
     st = await getSigStatusOnce(sig).catch(e => { errOnce('sigStatus', e.message); return null; });
     s  = st?.value?.[0];
     if (!s || s?.err) return null;
   }
 
-  // tx
-  let tx = await getTxConfirmed(sig).catch(e => { errOnce('getTxConfirmed', e.message); return null; });
-  if (!tx) tx = await getTxFinalized(sig).catch(e => { errOnce('getTxFinalized', e.message); return null; });
+  let tx = await getTransactionWith(sig, 'confirmed').catch(e => { errOnce('getTxConfirmed', e.message); return null; });
+  if (!tx) tx = await getTransactionWith(sig, 'finalized').catch(e => { errOnce('getTxFinalized', e.message); return null; });
   return tx;
 }
+
 
 /* ====================== WebSocket logs ====================== */
 async function startLogsListener() {
   try {
     wsStartSlot = await withRpcBudget(() => connection.getSlot('processed'), 'getSlot');
-    // Sans filtre → flux énorme. Utilise AMM_PROGRAM_IDS quand c’est possible.
-    if (!CFG.AMM_PROGRAM_IDS.length) {
+
+    const programIds = sanitizedProgramIds(CFG.AMM_PROGRAM_IDS);
+    if (!programIds.length) {
       connection.onLogs('all', onLogsHandler, 'processed');
       info('WS logs listener started for all');
       return;
     }
-    for (const id of CFG.AMM_PROGRAM_IDS) {
-      try {
-        const pk = new PublicKey(id);
-        connection.onLogs(pk, onLogsHandler, 'processed');
-        info(`WS logs listener started for program (mentions): ${pk.toBase58()}`);
-      } catch (e) {
-        warn(`Invalid AMM program id in AMM_PROGRAM_IDS: ${id} → ${e.message}`);
-      }
+    for (const id of programIds) {
+      const pk = new PublicKey(id);
+      connection.onLogs(pk, onLogsHandler, 'processed');
+      info(`WS logs listener started for program (mentions): ${pk.toBase58()}`);
     }
   } catch (e) {
     warn('startLogsListener failed:', e.message);
