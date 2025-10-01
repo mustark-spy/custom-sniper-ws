@@ -1,10 +1,10 @@
 /**
- * snipe_bot_ws_raw_gmgn.js — v3
- * WS logs + Webhook (raw/enhanced) → GMGN router (sign local + txproxy)
- * - Rate limit & backoff RPC (anti-429)
- * - Concurrency cap
- * - Anti-backlog WS (slots anciens ignorés)
- * - Garde-fous route, rug-guard, timeout exit
+ * snipe_bot_ws_raw_gmgn.js — v3 (Helius WS native)
+ * - WS Helius logsSubscribe (mentions) + signatureSubscribe → zero HTTP polling
+ * - File HTTP (RPS + concurrence + backoff) pour getTransaction
+ * - Garde-fous route GMGN / mini Rug-guard / timeout sortie
+ * - Webhook raw & enhanced conservés
+ * - Logs propres + rate-limit erreurs
  */
 
 import 'dotenv/config';
@@ -13,6 +13,7 @@ import bodyParser from 'body-parser';
 import fetch from 'node-fetch';
 import fs from 'fs';
 import bs58 from 'bs58';
+import WebSocket from 'ws';
 import {
   Connection,
   PublicKey,
@@ -24,28 +25,33 @@ import {
 /* ====================== Config ====================== */
 const CFG = {
   PORT: Number(process.env.PORT || 10000),
+
+  // RPC HTTP (Helius de préférence) — utilisé UNIQUEMENT après notif de signature
   RPC_URL: process.env.RPC_URL || 'https://api.mainnet-beta.solana.com',
 
-  // Entrée
+  // WebSocket Helius
+  HELIUS_WS_URL: process.env.HELIUS_WS_URL || '',
+
+  // Filtres d'entrée
   MAX_POOL_AGE_MS: Number(process.env.MAX_POOL_AGE_MS || 2500),
   TRIGGER_MIN_SOL: Number(process.env.TRIGGER_MIN_SOL || 200),
   PUMP_TRIGGER_MIN_SOL: Number(process.env.PUMP_TRIGGER_MIN_SOL || 350),
 
   // Trade
   TRADE_SIZE_SOL: Number(process.env.TRADE_SIZE_SOL || 0.20),
-  MAX_SLIPPAGE: Number(process.env.MAX_SLIPPAGE || 0.30),
+  MAX_SLIPPAGE: Number(process.env.MAX_SLIPPAGE || 0.30), // en %
   PRIORITY_FEE_SOL: Number(process.env.PRIORITY_FEE_SOL || 0.006),
   ANTI_MEV: ['1','true','yes'].includes(String(process.env.ANTI_MEV || '').toLowerCase()),
 
   // Sortie
   EXIT_TIMEOUT_MS: Number(process.env.EXIT_TIMEOUT_MS || 15000),
 
-  // Garde-fous route
+  // Garde-fous route (GMGN)
   MAX_PRICE_IMPACT_PCT: Number(process.env.MAX_PRICE_IMPACT_PCT || 22),
   MIN_OTHER_OVER_OUT: Number(process.env.MIN_OTHER_OVER_OUT || 0.965),
   MIN_OUT_PER_SOL: Number(process.env.MIN_OUT_PER_SOL || 0),
 
-  // Rug-guard
+  // Rug-guard post-entrée
   RUG_GUARD_WINDOW_MS: Number(process.env.RUG_GUARD_WINDOW_MS || 2000),
   RUG_DROP_PCT: Number(process.env.RUG_DROP_PCT || 30),
 
@@ -56,39 +62,19 @@ const CFG = {
   WALLET_SECRET_KEY: process.env.WALLET_SECRET_KEY || '',
   BASE_SOL_MINT: 'So11111111111111111111111111111111111111112',
 
-  // Logs
+  // Logs/CSV
   CSV_FILE: process.env.CSV_FILE || 'live_trades.csv',
   LOG_LEVEL: (process.env.LOG_LEVEL || 'info').toLowerCase(),
 
-  // WS: filtrage par programmes (mentions)
+  // AMM program filters (CSV). Vide → tous (déconseillé)
   AMM_PROGRAM_IDS: (process.env.AMM_PROGRAM_IDS || '')
     .split(',').map(s => s.trim()).filter(Boolean),
 
-  // Anti-429 / perf RPC
-  RPC_RPS: Number(process.env.RPC_RPS || 8),                 // budget req/s
-  RPC_MAX_CONCURRENCY: Number(process.env.RPC_MAX_CONCURRENCY || 3),
-  RPC_BACKOFF_MS: Number(process.env.RPC_BACKOFF_MS || 600), // backoff 429
+  // File RPC HTTP
+  RPC_RPS: Number(process.env.RPC_RPS || 6),
+  RPC_MAX_CONCURRENCY: Number(process.env.RPC_MAX_CONCURRENCY || 2),
+  RPC_BACKOFF_MS: Number(process.env.RPC_BACKOFF_MS || 700),
 };
-
-// base58-like, 32..44 chars
-const PK_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-
-function sanitizedProgramIds(list) {
-  const out = [];
-  for (const raw of list) {
-    const id = (raw || '').trim();
-    if (!id) continue;
-    if (!PK_RE.test(id)) { warn(`Invalid AMM program id in AMM_PROGRAM_IDS: "${raw}" → ignored`); continue; }
-    try {
-      // Also ensure it's a valid PublicKey
-      new PublicKey(id);
-      out.push(id);
-    } catch (e) {
-      warn(`Invalid AMM program id in AMM_PROGRAM_IDS: "${raw}" → ${e.message}`);
-    }
-  }
-  return out;
-}
 
 /* ====================== Logger ====================== */
 const dbg  = (...a) => { if (CFG.LOG_LEVEL === 'debug') console.log(...a); };
@@ -96,7 +82,6 @@ const info = (...a) => console.log(...a);
 const warn = (...a) => console.warn(...a);
 const err  = (...a) => console.error(...a);
 
-// Anti-spam pour erreurs répétées
 const lastErr = new Map();
 function errOnce(key, ...msg) {
   const now = Date.now();
@@ -109,9 +94,8 @@ function errOnce(key, ...msg) {
   }
 }
 
-/* ====================== Setup ====================== */
 if (!CFG.WALLET_SECRET_KEY) { err('❌ WALLET_SECRET_KEY manquant'); process.exit(1); }
-if (!CFG.GMGN_HOST) { err('❌ GMGN_HOST manquant'); process.exit(1); }
+if (!CFG.HELIUS_WS_URL) { err('❌ HELIUS_WS_URL manquant'); process.exit(1); }
 
 if (!fs.existsSync(CFG.CSV_FILE)) fs.writeFileSync(CFG.CSV_FILE, 'time,event,side,sol,token,extra\n');
 const csv = (r) => {
@@ -119,104 +103,110 @@ const csv = (r) => {
   fs.appendFileSync(CFG.CSV_FILE, line);
 };
 
+/* ====================== Setup ====================== */
 const connection = new Connection(CFG.RPC_URL, { commitment: 'processed' });
 const wallet = Keypair.fromSecretKey(bs58.decode(CFG.WALLET_SECRET_KEY));
 const WALLET_PK = wallet.publicKey.toBase58();
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fmt = (n, d=6) => (typeof n === 'number' ? Number(n).toFixed(d) : n);
+const PK_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
-/* ====================== Simple RPC rate-limiter ====================== */
-// Token-bucket + concurrency cap
-let tokens = CFG.RPC_RPS;
-let inFlight = 0;
-setInterval(() => { tokens = CFG.RPC_RPS; }, 1000);
-
-async function withRpcBudget(fn, label='rpc') {
-  // concurrency gate
-  while (inFlight >= CFG.RPC_MAX_CONCURRENCY) await sleep(5);
-  // token gate
-  while (tokens <= 0) await sleep(5);
-  tokens--;
-  inFlight++;
-  try {
-    return await fn();
-  } catch (e) {
-    // backoff on 429
-    const m = String(e?.message || '');
-    if (m.includes('429') || m.includes('Too Many Requests')) {
-      errOnce('429', 'Server responded with 429 Too Many Requests. Retrying after', CFG.RPC_BACKOFF_MS, 'ms...');
-      await sleep(CFG.RPC_BACKOFF_MS);
-    }
-    throw e;
-  } finally {
-    inFlight--;
+/* ====================== File HTTP (RPS + Concurrency) ====================== */
+class HttpBucket {
+  constructor({ rps, concurrency, backoffMs }) {
+    this.interval = Math.max(1000 / Math.max(1, rps), 50);
+    this.maxConc = Math.max(1, concurrency);
+    this.backoff = Math.max(100, backoffMs);
+    this.queue = [];
+    this.running = 0;
+    setInterval(() => this._drain(), this.interval);
   }
+  push(fn, tag='') {
+    return new Promise((resolve) => {
+      this.queue.push({ fn, resolve, tag });
+      this._drain();
+    });
+  }
+  async _drain() {
+    while (this.running < this.maxConc && this.queue.length) {
+      const task = this.queue.shift();
+      this.running++;
+      (async () => {
+        try {
+          const out = await task.fn();
+          task.resolve(out);
+        } catch (e) {
+          if (String(e?.message||'').includes('429') || String(e?.message||'').includes('rate limited')) {
+            errOnce('429', `Server responded with 429 Too Many Requests. Retrying after ${this.backoff}ms delay...`);
+            await sleep(this.backoff);
+          }
+          task.resolve(null);
+        } finally {
+          this.running--;
+        }
+      })();
+    }
+  }
+}
+const httpBucket = new HttpBucket({
+  rps: CFG.RPC_RPS,
+  concurrency: CFG.RPC_MAX_CONCURRENCY,
+  backoffMs: CFG.RPC_BACKOFF_MS,
+});
+
+async function getTransactionOnce(sig, commitment='confirmed') {
+  return await httpBucket.push(
+    () => connection.getTransaction(sig, { commitment, maxSupportedTransactionVersion: 0 }),
+    `getTx:${commitment}`,
+  );
 }
 
 /* ====================== Helpers extraction ====================== */
-function tsFromPayloadMs(payload) {
-  const t = payload?.timestamp ?? payload?.blockTime;
-  if (!t) return null;
-  return Number(t) * 1000;
+function tsFromTxMs(tx) {
+  const t = tx?.blockTime;
+  return (t ? Number(t) * 1000 : null);
 }
-function poolAgeMs(payload) {
-  const t = tsFromPayloadMs(payload);
+function poolAgeFromTxMs(tx) {
+  const t = tsFromTxMs(tx);
   if (!t) return null;
   return Date.now() - t;
 }
-function estimateSolAdded(payload) {
-  const solMint = CFG.BASE_SOL_MINT;
-  const tt = payload?.tokenTransfers || [];
-  let by = 0;
-  for (const x of tt) if (x.mint === solMint && x.tokenAmount > 0) by += Number(x.tokenAmount);
-  if (by > 0) return by;
-  const pre = payload?.meta?.preBalances || [];
-  const post = payload?.meta?.postBalances || [];
-  if (pre.length && post.length) {
-    let delta = 0;
-    for (let i=0;i<post.length;i++) {
-      const diff = (post[i] - (pre[i]||0));
-      if (diff > 0) delta += diff / LAMPORTS_PER_SOL;
-    }
-    if (delta > 0) return delta;
+function estimateSolAddedFromTx(tx) {
+  const pre = tx?.meta?.preBalances || [];
+  const post = tx?.meta?.postBalances || [];
+  if (!pre.length || !post.length) return 0;
+  let delta = 0;
+  for (let i=0;i<post.length;i++) {
+    const d = (post[i] - (pre[i]||0));
+    if (d > 0) delta += d / LAMPORTS_PER_SOL;
   }
-  return 0;
+  return delta;
 }
-function extractMint(payload) {
-  const acc = payload?.accountData || [];
-  const deltas = new Map();
-  for (const a of acc) {
-    for (const t of (a.tokenBalanceChanges || [])) {
-      const mint = t.mint;
-      const raw = Number(t.rawTokenAmount?.tokenAmount || 0);
-      if (raw > 0) deltas.set(mint, (deltas.get(mint) || 0) + raw / (10 ** (t.rawTokenAmount?.decimals ?? 9)));
-    }
-  }
-  if (deltas.size) return [...deltas.entries()].sort((a,b)=>b[1]-a[1])[0][0];
-  const pre = payload?.meta?.preTokenBalances || [];
-  const post = payload?.meta?.postTokenBalances || [];
-  const byMint = {};
+function extractMintFromTx(tx) {
+  // heuristique: plus grand delta token+
+  const pre = tx?.meta?.preTokenBalances || [];
+  const post = tx?.meta?.postTokenBalances || [];
+  const by = new Map();
   for (const p of post) {
     const mint = p.mint;
     const postAmt = Number(p.uiTokenAmount?.uiAmount || 0);
     const preEntry = pre.find(x => x.accountIndex === p.accountIndex);
     const preAmt = preEntry ? Number(preEntry.uiTokenAmount?.uiAmount || 0) : 0;
     const delta = postAmt - preAmt;
-    if (delta > 0) byMint[mint] = (byMint[mint] || 0) + delta;
+    if (delta > 0) by.set(mint, (by.get(mint)||0) + delta);
   }
-  const cand = Object.entries(byMint).sort((a,b)=>b[1]-a[1]);
-  return cand.length ? cand[0][0] : null;
+  if (!by.size) return null;
+  return [...by.entries()].sort((a,b)=>b[1]-a[1])[0][0];
 }
-function collectProgramsFromTxPayload(payload) {
+function collectProgramsFromTx(tx) {
   const seen = new Set();
-  const keys = payload?.transaction?.message?.accountKeys || [];
-  if (payload?.programId) seen.add(String(payload.programId));
-  for (const ins of (payload?.transaction?.message?.instructions || [])) {
+  const keys = tx?.transaction?.message?.accountKeys || [];
+  for (const ins of (tx?.transaction?.message?.instructions || [])) {
     if (ins.programId) seen.add(String(ins.programId));
     if (ins.programIdIndex !== undefined && keys[ins.programIdIndex]) seen.add(String(keys[ins.programIdIndex]));
   }
-  for (const grp of (payload?.meta?.innerInstructions || [])) {
+  for (const grp of (tx?.meta?.innerInstructions || [])) {
     for (const ins of (grp.instructions || [])) {
       if (ins.programId) seen.add(String(ins.programId));
       if (ins.programIdIndex !== undefined && keys[ins.programIdIndex]) seen.add(String(keys[ins.programIdIndex]));
@@ -275,8 +265,6 @@ function ratioOutOverIn(quote) {
   if (inp <= 0) return 0;
   return out / inp;
 }
-
-/* ====================== Guards ====================== */
 function assertRouteGuards(routeData) {
   const q = routeData.quote || {};
   const impactPct = Number(q?.priceImpactPct || 0) * 100;
@@ -345,16 +333,10 @@ async function buyViaGMGN(mint) {
 async function getTokenBalanceLamports(owner, mint) {
   const ownerPk = new PublicKey(owner);
   const mintPk  = new PublicKey(mint);
-  const resp = await withRpcBudget(
-    () => connection.getTokenAccountsByOwner(ownerPk, { mint: mintPk }),
-    'getTokenAccountsByOwner'
-  );
+  const resp = await connection.getTokenAccountsByOwner(ownerPk, { mint: mintPk });
   let total = 0n;
   for (const it of resp.value) {
-    const acc = await withRpcBudget(
-      () => connection.getParsedAccountInfo(it.pubkey),
-      'getParsedAccountInfo'
-    );
+    const acc = await connection.getParsedAccountInfo(it.pubkey);
     const amt = BigInt(acc.value?.data?.parsed?.info?.tokenAmount?.amount || '0');
     total += amt;
   }
@@ -439,140 +421,142 @@ async function rugGuardAfterBuy({ mint, entryRatio }) {
   }
 }
 
-/* ====================== Unified handler ====================== */
-const seenMint = new Map();     // anti-refire 30s
-const seenSig  = new Set();     // anti-dup WS
-let wsStartSlot = 0;            // anti-backlog
+/* ====================== Handler (depuis tx confirmé) ====================== */
+const seenMint = new Map();           // anti-refire 30s
+async function handleFromTx(sig, tx) {
+  const mint = extractMintFromTx(tx);
+  if (!mint) { dbg('skip: no mint'); return; }
 
-setInterval(() => { if (seenSig.size > 4000) seenSig.clear(); }, 120000);
+  const added = estimateSolAddedFromTx(tx);
+  const age = poolAgeFromTxMs(tx);
+  const progs = collectProgramsFromTx(tx);
+  const src = progs.includes('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA') ? 'PUMP_AMM' : 'unknown';
 
-async function handleDetected(payload, srcHint='unknown', extra={}) {
+  info(`🚀 token=${mint} | src=${src} | added≈${fmt(added)} SOL | age=${age==null?'n/a':age+'ms'} sig=${sig}`);
+
+  const minSol = (src === 'PUMP_AMM') ? CFG.PUMP_TRIGGER_MIN_SOL : CFG.TRIGGER_MIN_SOL;
+  if (age != null && age > CFG.MAX_POOL_AGE_MS) return;
+  if (added < minSol) return;
+
+  const now = Date.now();
+  if (seenMint.get(mint) && now - seenMint.get(mint) < 30000) return;
+  seenMint.set(mint, now);
+
   try {
-    const t = payload?.type || 'UNKNOWN';
-    const src = payload?.source || srcHint || 'unknown';
-    const mint = extractMint(payload);
-    const added = estimateSolAdded(payload);
-    const age = poolAgeMs(payload);
+    const { route } = await buyViaGMGN(mint);
+    const entryRatio = ratioOutOverIn(route.quote) || 0;
 
-    if (!mint) { dbg('skip: no mint'); return { ok:false, reason:'no-mint' }; }
+    // rug guard async
+    rugGuardAfterBuy({ mint, entryRatio }).catch(()=>{});
 
-    info(`🚀 token=${mint} | type=${t} src=${src} | added≈${fmt(added,6)} SOL | age=${age==null?'n/a':age+'ms'} ${extra.signature ? 'sig='+extra.signature : ''}`);
-
-    const minSol = (src === 'PUMP_AMM') ? CFG.PUMP_TRIGGER_MIN_SOL : CFG.TRIGGER_MIN_SOL;
-
-    if (age != null && age > CFG.MAX_POOL_AGE_MS) return { ok:false, reason:'old-pool', age };
-    if (added < minSol) return { ok:false, reason:'below-threshold', added, minSol };
-
-    const now = Date.now();
-    if (seenMint.get(mint) && now - seenMint.get(mint) < 30000) return { ok:false, reason:'cooldown' };
-    seenMint.set(mint, now);
-
-    try {
-      const { route, hash } = await buyViaGMGN(mint);
-      const entryRatio = ratioOutOverIn(route.quote) || 0;
-
-      rugGuardAfterBuy({ mint, entryRatio }).catch(()=>{});
-      if (CFG.EXIT_TIMEOUT_MS > 0) {
-        setTimeout(async () => {
-          info(`⏳ Timeout ${CFG.EXIT_TIMEOUT_MS}ms → SELL ALL ${mint}`);
-          await sellAllViaGMGN(mint);
-        }, CFG.EXIT_TIMEOUT_MS);
-      }
-      return { ok:true, mint, hash, added, src };
-    } catch (e) {
-      err('Buy failed:', e.message);
-      return { ok:false, reason:'buy-failed', err:e.message };
+    // timeout sortie
+    if (CFG.EXIT_TIMEOUT_MS > 0) {
+      setTimeout(async () => {
+        info(`⏳ Timeout ${CFG.EXIT_TIMEOUT_MS}ms → SELL ALL ${mint}`);
+        await sellAllViaGMGN(mint);
+      }, CFG.EXIT_TIMEOUT_MS);
     }
   } catch (e) {
-    err('handleDetected error:', e);
-    return { ok:false, reason:'internal', err:e.message };
+    err('Buy failed:', e.message);
   }
 }
 
-/* ====================== Fetch tx — lean retries ====================== */
-async function getSigStatusOnce(sig) {
-  return await withRpcBudget(
-    () => connection.getSignatureStatuses([sig], { searchTransactionHistory: true }),
-    'getSignatureStatuses'
-  );
+/* ====================== Helius WS client ====================== */
+function sanitizedProgramIds(list) {
+  const out = [];
+  for (const raw of list) {
+    const id = (raw || '').trim();
+    if (!id) continue;
+    if (!PK_RE.test(id)) { warn(`Invalid AMM program id: "${raw}" → ignored`); continue; }
+    try { new PublicKey(id); out.push(id); } catch (e) { warn(`Invalid AMM program id: "${raw}" → ${e.message}`); }
+  }
+  return out;
 }
 
-async function getTransactionWith(sig, commitment) {
-  return await withRpcBudget(
-    () => connection.getTransaction(sig, { commitment, maxSupportedTransactionVersion: 0 }),
-    `getTransaction(${commitment})`
-  );
-}
+class HeliusWS {
+  constructor(url) {
+    this.url = url;
+    this.ws = null;
+    this.subs = new Map(); // key -> payload
+    this.pinger = null;
+    this.reconnTimer = null;
+    this.nextId = 1;
+  }
+  start() { this._connect(); }
+  stop() { try { this.ws?.close(); } catch{} clearInterval(this.pinger); clearTimeout(this.reconnTimer); }
 
-/**
- * Lean policy:
- *  1) status once; if not confirmed → short wait → status again
- *  2) if confirmed → getTransaction(confirmed), else try finalized once
- */
-async function fetchTxAfterConfirmed(sig) {
-  let st = await getSigStatusOnce(sig).catch(e => { errOnce('sigStatus', e.message); return null; });
-  let s  = st?.value?.[0];
-  if (s?.err) return null;
-
-  if (!s || (s.confirmationStatus !== 'confirmed' && s.confirmationStatus !== 'finalized' && (s.confirmations ?? 0) < 1)) {
-    await sleep(200);
-    st = await getSigStatusOnce(sig).catch(e => { errOnce('sigStatus', e.message); return null; });
-    s  = st?.value?.[0];
-    if (!s || s?.err) return null;
+  _connect() {
+    this.ws = new WebSocket(this.url);
+    this.ws.on('open', () => {
+      info('WS connected:', this.url);
+      // resubscribe
+      for (const [, payload] of this.subs) this._send(payload);
+      // keep-alive ping
+      clearInterval(this.pinger);
+      this.pinger = setInterval(() => { try { this.ws?.ping?.(); } catch{} }, 45000);
+    });
+    this.ws.on('message', (d) => this._onMessage(d));
+    this.ws.on('close', () => {
+      warn('WS closed — reconnect in 2s');
+      clearInterval(this.pinger);
+      clearTimeout(this.reconnTimer);
+      this.reconnTimer = setTimeout(() => this._connect(), 2000);
+    });
+    this.ws.on('error', (e) => errOnce('ws', 'WS error:', e.message));
   }
 
-  let tx = await getTransactionWith(sig, 'confirmed').catch(e => { errOnce('getTxConfirmed', e.message); return null; });
-  if (!tx) tx = await getTransactionWith(sig, 'finalized').catch(e => { errOnce('getTxFinalized', e.message); return null; });
-  return tx;
-}
+  _send(obj) {
+    const json = JSON.stringify(obj);
+    try { this.ws?.send(json); } catch (e) { errOnce('wsSend', e.message); }
+  }
 
+  logsSubscribeMentions(pubkey, commitment='processed') {
+    const id = this.nextId++;
+    const payload = {
+      jsonrpc: '2.0',
+      id,
+      method: 'logsSubscribe',
+      params: [{ mentions: [pubkey] }, { commitment }],
+    };
+    this.subs.set(`logs:${pubkey}`, payload);
+    this._send(payload);
+    info(`WS logs listener started (mentions): ${pubkey}`);
+  }
 
-/* ====================== WebSocket logs ====================== */
-async function startLogsListener() {
-  try {
-    wsStartSlot = await withRpcBudget(() => connection.getSlot('processed'), 'getSlot');
+  signatureSubscribe(sig, commitment='confirmed') {
+    const id = this.nextId++;
+    const payload = {
+      jsonrpc: '2.0',
+      id,
+      method: 'signatureSubscribe',
+      params: [sig, { commitment }],
+    };
+    // pas besoin de garder, one-shot
+    this._send(payload);
+  }
 
-    const programIds = sanitizedProgramIds(CFG.AMM_PROGRAM_IDS);
-    if (!programIds.length) {
-      connection.onLogs('all', onLogsHandler, 'processed');
-      info('WS logs listener started for all');
-      return;
+  async _onMessage(data) {
+    let msg = null;
+    try { msg = JSON.parse(String(data)); } catch { return; }
+
+    // notifications:
+    if (msg?.method === 'logsNotification') {
+      const sig = msg?.params?.result?.value?.signature;
+      if (!sig) return;
+      // on demande la confirmation via signatureSubscribe (zero http polling)
+      this.signatureSubscribe(sig, 'confirmed');
     }
-    for (const id of programIds) {
-      const pk = new PublicKey(id);
-      connection.onLogs(pk, onLogsHandler, 'processed');
-      info(`WS logs listener started for program (mentions): ${pk.toBase58()}`);
+    if (msg?.method === 'signatureNotification') {
+      const sig   = msg?.params?.result?.value?.signature || msg?.params?.result?.signature;
+      const errV  = msg?.params?.result?.value?.err ?? msg?.params?.result?.err ?? null;
+      if (!sig) return;
+      if (errV) return; // tx failed, ignore
+      // maintenant un seul getTransaction(confirmed)
+      const tx = await getTransactionOnce(sig, 'confirmed');
+      if (!tx) return;
+      await handleFromTx(sig, tx);
     }
-  } catch (e) {
-    warn('startLogsListener failed:', e.message);
   }
-}
-
-async function onLogsHandler(logInfo) {
-  const { signature: sig, slot } = (logInfo || {});
-  if (!sig) return;
-
-  // Anti-backlog: on ignore les slots significativement antérieurs au slot courant
-  if (wsStartSlot && slot && slot < wsStartSlot - 2) { dbg('skip backlog slot', slot); return; }
-
-  if (seenSig.has(sig)) return;
-  seenSig.add(sig);
-
-  const tx = await fetchTxAfterConfirmed(sig);
-  if (!tx) { dbg('tx not found for sig', sig); return; }
-
-  const payload = {
-    transaction: tx.transaction,
-    meta: tx.meta,
-    slot: tx.slot,
-    timestamp: tx.blockTime || null,
-  };
-
-  const progs = collectProgramsFromTxPayload(payload);
-  let src = 'unknown';
-  if (progs.includes('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA')) src = 'PUMP_AMM';
-
-  await handleDetected(payload, src, { signature: sig });
 }
 
 /* ====================== Webhook (raw + enhanced) ====================== */
@@ -581,32 +565,24 @@ app.use(bodyParser.json({ limit: '20mb' }));
 
 app.post('/helius-webhook', async (req, res) => {
   try {
+    // RAW: {signature:"..."} ou body string
     if (req.body && (req.body.signature || req.body.txSig || typeof req.body === 'string')) {
       const sig = req.body.signature || req.body.txSig || (typeof req.body === 'string' ? req.body : null);
       info('RAW webhook sig:', sig);
-
-      const tx = await fetchTxAfterConfirmed(sig);
-      if (!tx) {
-        warn('raw webhook: tx not found (confirmed timeout) sig', sig);
-        return res.status(200).send({ ok:true, note:'tx-not-found', sig });
-      }
-      const payload = { transaction: tx.transaction, meta: tx.meta, slot: tx.slot, timestamp: tx.blockTime || null };
-      const progs = collectProgramsFromTxPayload(payload);
-      let src = 'unknown';
-      if (progs.includes('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA')) src = 'PUMP_AMM';
-      const r = await handleDetected(payload, src, { signature: sig });
-      return res.status(200).send(r);
+      const tx = await getTransactionOnce(sig, 'confirmed');
+      if (!tx) return res.status(200).send({ ok:true, note:'tx-not-found', sig });
+      await handleFromTx(sig, tx);
+      return res.status(200).send({ ok:true, processed:true, sig });
     }
 
+    // Enhanced Helius
     const payload = Array.isArray(req.body) ? req.body[0] : req.body;
-    const t = payload?.type || 'UNKNOWN';
-    const src = payload?.source || 'unknown';
-    if (!['CREATE_POOL','ADD_LIQUIDITY'].includes(t)) {
-      dbg(`skip: ignored-type (${t})`);
-      return res.status(200).send({ ok:true, note:'ignored-type', type:t });
-    }
-    const r = await handleDetected(payload, src, {});
-    return res.status(200).send(r);
+    const sig = payload?.signature || payload?.transaction?.signatures?.[0];
+    if (!sig) return res.status(200).send({ ok:true, note:'no-signature' });
+    const tx = await getTransactionOnce(sig, 'confirmed');
+    if (!tx) return res.status(200).send({ ok:true, note:'tx-not-found', sig });
+    await handleFromTx(sig, tx);
+    return res.status(200).send({ ok:true, processed:true, sig });
   } catch (e) {
     err('webhook error:', e.message || e);
     return res.status(500).send({ ok:false, error: e.message || String(e) });
@@ -626,16 +602,23 @@ app.get('/health', (_req, res) => res.send({
     antiMEV: CFG.ANTI_MEV,
     exitTimeoutMs: CFG.EXIT_TIMEOUT_MS,
     ammPrograms: CFG.AMM_PROGRAM_IDS,
-    rpc: {
-      rps: CFG.RPC_RPS,
-      maxConcurrency: CFG.RPC_MAX_CONCURRENCY,
-      backoffMs: CFG.RPC_BACKOFF_MS,
-    },
+    rpc: { rps: CFG.RPC_RPS, conc: CFG.RPC_MAX_CONCURRENCY, backoffMs: CFG.RPC_BACKOFF_MS },
+    heliusWs: !!CFG.HELIUS_WS_URL,
   },
 }));
 
 /* ====================== Start ====================== */
 app.listen(CFG.PORT, () => {
   info(`GMGN sniping listener on :${CFG.PORT} (LOG_LEVEL=${CFG.LOG_LEVEL})`);
-  startLogsListener();
+
+  // Helius WS
+  const ws = new HeliusWS(CFG.HELIUS_WS_URL);
+  const programs = sanitizedProgramIds(CFG.AMM_PROGRAM_IDS);
+  if (programs.length === 0) {
+    warn('AMM_PROGRAM_IDS vide → tu écouteras TOUT via logsSubscribe(all) n’est PAS recommandé, donc on écoute seulement Pump AMM par défaut.');
+    ws.logsSubscribeMentions('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 'processed');
+  } else {
+    for (const id of programs) ws.logsSubscribeMentions(id, 'processed');
+  }
+  ws.start();
 });
