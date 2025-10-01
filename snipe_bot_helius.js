@@ -2,7 +2,7 @@
  * snipe_bot_ws_raw_gmgn.js — v3.1 (Helius WS stricte)
  * - WS Helius logsSubscribe uniquement sur AMM_PROGRAM_IDS
  * - Zero fallback → si liste vide, rien n’est écouté
- * - Garde-fous route GMGN / mini Rug-guard / timeout sortie
+ * - Garde-fous route GMGN / Rug-guard / timeout sortie
  * - Logs propres (skip reason visibles)
  */
 
@@ -84,6 +84,54 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fmt = (n, d=6) => (typeof n === 'number' ? Number(n).toFixed(d) : n);
 const PK_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
+/* ====================== HTTP Bucket ====================== */
+class HttpBucket {
+  constructor({ rps, concurrency, backoffMs }) {
+    this.interval = Math.max(1000 / Math.max(1, rps), 50);
+    this.maxConc = Math.max(1, concurrency);
+    this.backoff = Math.max(100, backoffMs);
+    this.queue = [];
+    this.running = 0;
+    setInterval(() => this._drain(), this.interval);
+  }
+  push(fn) {
+    return new Promise((resolve) => {
+      this.queue.push({ fn, resolve });
+      this._drain();
+    });
+  }
+  async _drain() {
+    while (this.running < this.maxConc && this.queue.length) {
+      const task = this.queue.shift();
+      this.running++;
+      (async () => {
+        try {
+          const out = await task.fn();
+          task.resolve(out);
+        } catch (e) {
+          if (String(e?.message||'').includes('429')) {
+            warn(`429 rate-limited, retry in ${this.backoff}ms`);
+            await sleep(this.backoff);
+          }
+          task.resolve(null);
+        } finally {
+          this.running--;
+        }
+      })();
+    }
+  }
+}
+const httpBucket = new HttpBucket({
+  rps: CFG.RPC_RPS,
+  concurrency: CFG.RPC_MAX_CONCURRENCY,
+  backoffMs: CFG.RPC_BACKOFF_MS,
+});
+async function getTransactionOnce(sig, commitment='confirmed') {
+  return await httpBucket.push(() => 
+    connection.getTransaction(sig, { commitment, maxSupportedTransactionVersion: 0 })
+  );
+}
+
 /* ====================== Extract Helpers ====================== */
 function tsFromTxMs(tx) { return tx?.blockTime ? tx.blockTime * 1000 : null; }
 function poolAgeFromTxMs(tx) { const t = tsFromTxMs(tx); return t ? Date.now() - t : null; }
@@ -120,74 +168,109 @@ function collectProgramsFromTx(tx) {
   }
   return [...seen];
 }
+function ratioOutOverIn(quote) {
+  const out = Number(quote?.outAmount||0), inp = Number(quote?.inAmount||0);
+  return inp>0 ? out/inp : 0;
+}
 
-/* ====================== BUY/SELL & Rug-guard (inchangé) ====================== */
-// ... (reprend tes fonctions buyViaGMGN, sellAllViaGMGN, rugGuardAfterBuy)
-// (je ne les recolle pas ici pour alléger, mais elles restent inchangées)
+/* ====================== GMGN helpers ====================== */
+async function gmgnGetRoute({ tokenIn, tokenOut, inLamports, fromAddress, slippagePct, feeSol, isAntiMev }) {
+  const params = new URLSearchParams({
+    token_in_address: tokenIn,
+    token_out_address: tokenOut,
+    in_amount: String(inLamports),
+    from_address: fromAddress,
+    slippage: String(slippagePct * 100),
+    swap_mode: 'ExactIn',
+  });
+  if (feeSol && feeSol > 0) params.set('fee', String(feeSol));
+  if (isAntiMev) params.set('is_anti_mev', 'true');
+  const url = `${CFG.GMGN_HOST}/defi/router/v1/sol/tx/get_swap_route?${params.toString()}`;
+  const res = await fetch(url); const data = await res.json().catch(()=>({}));
+  if (!res.ok || data.code!==0) throw new Error(`GMGN route error ${JSON.stringify(data)}`);
+  return data.data;
+}
+async function gmgnSubmitSignedTx(base64Signed, isAntiMev=false) {
+  const res = await fetch(`${CFG.GMGN_HOST}/txproxy/v1/send_transaction`, {
+    method:'POST',headers:{'content-type':'application/json'},
+    body: JSON.stringify({ chain:'sol', signedTx: base64Signed, isAntiMev })
+  });
+  const data = await res.json().catch(()=>({}));
+  if (!res.ok || data.code!==0) throw new Error(`GMGN submit error ${JSON.stringify(data)}`);
+  return data.data;
+}
+async function gmgnCheckStatus({ hash, lastValidBlockHeight }) {
+  const url=`${CFG.GMGN_HOST}/defi/router/v1/sol/tx/get_transaction_status?hash=${hash}&last_valid_height=${lastValidBlockHeight}`;
+  const res=await fetch(url); const data=await res.json().catch(()=>({}));
+  if (!res.ok || data.code!==0) throw new Error(`GMGN status error ${JSON.stringify(data)}`);
+  return data.data;
+}
+
+/* ====================== BUY / SELL ====================== */
+async function buyViaGMGN(mint) {
+  const inLamports=Math.floor(CFG.TRADE_SIZE_SOL*LAMPORTS_PER_SOL);
+  const route=await gmgnGetRoute({tokenIn:CFG.BASE_SOL_MINT,tokenOut:mint,inLamports,fromAddress:WALLET_PK,slippagePct:CFG.MAX_SLIPPAGE,feeSol:CFG.PRIORITY_FEE_SOL,isAntiMev:CFG.ANTI_MEV});
+  const unsigned=Buffer.from(route.raw_tx.swapTransaction,'base64');
+  const tx=VersionedTransaction.deserialize(unsigned); tx.sign([wallet]);
+  const signed=Buffer.from(tx.serialize()).toString('base64');
+  const submit=await gmgnSubmitSignedTx(signed,CFG.ANTI_MEV);
+  info(`[BUY] pending hash=${submit.hash}`); csv({event:'enter',side:'BUY',sol:CFG.TRADE_SIZE_SOL,token:mint,extra:`hash=${submit.hash}`});
+  return {route,hash:submit.hash};
+}
+async function getTokenBalanceLamports(owner,mint){
+  const resp=await connection.getTokenAccountsByOwner(new PublicKey(owner),{mint:new PublicKey(mint)});
+  let total=0n; for(const it of resp.value){const acc=await connection.getParsedAccountInfo(it.pubkey); total+=BigInt(acc.value?.data?.parsed?.info?.tokenAmount?.amount||'0');}
+  return Number(total);
+}
+async function sellAllViaGMGN(mint){
+  const amountIn=await getTokenBalanceLamports(WALLET_PK,mint); if(amountIn<=0){warn('[SELL] skip no balance');return;}
+  const route=await gmgnGetRoute({tokenIn:mint,tokenOut:CFG.BASE_SOL_MINT,inLamports:amountIn,fromAddress:WALLET_PK,slippagePct:CFG.MAX_SLIPPAGE,feeSol:CFG.PRIORITY_FEE_SOL,isAntiMev:CFG.ANTI_MEV});
+  const unsigned=Buffer.from(route.raw_tx.swapTransaction,'base64'); const tx=VersionedTransaction.deserialize(unsigned); tx.sign([wallet]);
+  const signed=Buffer.from(tx.serialize()).toString('base64'); const submit=await gmgnSubmitSignedTx(signed,CFG.ANTI_MEV);
+  info(`[SELL] pending hash=${submit.hash}`); csv({event:'exit',side:'SELL',token:mint,extra:`hash=${submit.hash}`});
+}
+
+/* ====================== Rug-guard ====================== */
+async function rugGuardAfterBuy({ mint, entryRatio }) {
+  const t0=Date.now(),probeIn=Math.max(1,Math.floor(0.01*LAMPORTS_PER_SOL));
+  while(Date.now()-t0<CFG.RUG_GUARD_WINDOW_MS){
+    try{
+      const probe=await gmgnGetRoute({tokenIn:CFG.BASE_SOL_MINT,tokenOut:mint,inLamports:probeIn,fromAddress:WALLET_PK,slippagePct:CFG.MAX_SLIPPAGE,feeSol:CFG.PRIORITY_FEE_SOL,isAntiMev:CFG.ANTI_MEV});
+      const ratio=ratioOutOverIn(probe.quote); if(entryRatio>0){const dropPct=(1-(ratio/entryRatio))*100; if(dropPct>=CFG.RUG_DROP_PCT){warn(`[RUG] drop ${dropPct.toFixed(1)}% SELL`); await sellAllViaGMGN(mint); return;}}
+    }catch{} await sleep(250);
+  }
+}
 
 /* ====================== Handler ====================== */
-const seenMint = new Map();
-async function handleFromTx(sig, tx) {
-  const mint = extractMintFromTx(tx);
-  if (!mint) { info(`[SKIP] no mint extracted sig=${sig}`); return; }
-  const added = estimateSolAddedFromTx(tx);
-  const age = poolAgeFromTxMs(tx);
-  const progs = collectProgramsFromTx(tx);
-  const src = progs.includes('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA') ? 'PUMP_AMM' : 'unknown';
-
-  const minSol = (src === 'PUMP_AMM') ? CFG.PUMP_TRIGGER_MIN_SOL : CFG.TRIGGER_MIN_SOL;
-  if (age!=null && age>CFG.MAX_POOL_AGE_MS) { info(`[SKIP] old-pool ${age}ms mint=${mint}`); return; }
-  if (added<minSol) { info(`[SKIP] below-threshold added=${fmt(added)} < ${minSol} mint=${mint}`); return; }
-
-  info(`🚀 token=${mint} | src=${src} | added≈${fmt(added)} SOL | age=${age}ms sig=${sig}`);
-  const now = Date.now(); if (seenMint.get(mint)&&now-seenMint.get(mint)<30000) { info(`[SKIP] cooldown mint=${mint}`); return; }
-  seenMint.set(mint, now);
-  try {
-    const { route } = await buyViaGMGN(mint);
-    rugGuardAfterBuy({ mint, entryRatio: ratioOutOverIn(route.quote) }).catch(()=>{});
-    if (CFG.EXIT_TIMEOUT_MS>0) setTimeout(()=>sellAllViaGMGN(mint), CFG.EXIT_TIMEOUT_MS);
-  } catch(e) { err('Buy failed:', e.message); }
+const seenMint=new Map();
+async function handleFromTx(sig,tx){
+  const mint=extractMintFromTx(tx); if(!mint){info(`[SKIP] no mint sig=${sig}`);return;}
+  const added=estimateSolAddedFromTx(tx); const age=poolAgeFromTxMs(tx); const progs=collectProgramsFromTx(tx);
+  if(age!=null&&age>CFG.MAX_POOL_AGE_MS){info(`[SKIP] old ${age}ms`);return;}
+  if(added<CFG.TRIGGER_MIN_SOL){info(`[SKIP] low added=${fmt(added)}`);return;}
+  info(`🚀 token=${mint} added≈${fmt(added)} age=${age}ms sig=${sig}`);
+  const now=Date.now(); if(seenMint.get(mint)&&now-seenMint.get(mint)<30000){info(`[SKIP] cooldown`);return;}
+  seenMint.set(mint,now); try{const {route}=await buyViaGMGN(mint); rugGuardAfterBuy({mint,entryRatio:ratioOutOverIn(route.quote)});}catch(e){err('Buy failed',e.message);}
 }
 
 /* ====================== Helius WS ====================== */
-function sanitizedProgramIds(list) {
-  return list.filter(id => PK_RE.test(id));
-}
-class HeliusWS {
-  constructor(url) { this.url=url; this.ws=null; this.subs=[]; this.nextId=1; }
-  start(ids) {
+function sanitizedProgramIds(list){return list.filter(id=>PK_RE.test(id));}
+class HeliusWS{
+  constructor(url){this.url=url;}
+  start(ids){
     this.ws=new WebSocket(this.url);
-    this.ws.on('open',()=>{
-      info('WS connected:',this.url);
-      for(const id of ids) this.logsSubscribeMentions(id);
-      setInterval(()=>{ try{this.ws?.ping?.()}catch{} },45000);
-    });
-    this.ws.on('message',(d)=>this._onMessage(d));
-    this.ws.on('close',()=>{warn('WS closed, reconnect in 2s');setTimeout(()=>this.start(ids),2000);});
+    this.ws.on('open',()=>{info('WS connected');for(const id of ids)this._sub(id);setInterval(()=>{try{this.ws?.ping?.()}catch{}},45000);});
+    this.ws.on('message',(d)=>this._msg(d,ids)); this.ws.on('close',()=>{warn('WS closed reconnect');setTimeout(()=>this.start(ids),2000);});
   }
-  logsSubscribeMentions(pubkey) {
-    const payload={jsonrpc:'2.0',id:this.nextId++,method:'logsSubscribe',params:[{mentions:[pubkey]},{commitment:'processed'}]};
-    this.subs.push(payload); this.ws?.send(JSON.stringify(payload));
-    info(`WS subscribed: ${pubkey}`);
-  }
-  async _onMessage(data){
-    let msg;try{msg=JSON.parse(String(data))}catch{return;}
-    if(msg?.method==='logsNotification'){
-      const sig=msg?.params?.result?.value?.signature; if(!sig)return;
-      const tx=await getTransactionOnce(sig,'confirmed'); if(!tx)return;
-      const progs=collectProgramsFromTx(tx);
-      if(!CFG.AMM_PROGRAM_IDS.some(p=>progs.includes(p))) return; // filtre strict
-      await handleFromTx(sig,tx);
-    }
-  }
+  _sub(pubkey){this.ws?.send(JSON.stringify({jsonrpc:'2.0',id:1,method:'logsSubscribe',params:[{mentions:[pubkey]},{commitment:'processed'}]})); info(`WS subscribed ${pubkey}`);}
+  async _msg(d,ids){let m;try{m=JSON.parse(d)}catch{return;} if(m?.method==='logsNotification'){const sig=m?.params?.result?.value?.signature;if(!sig)return;const tx=await getTransactionOnce(sig,'confirmed');if(!tx)return;const progs=collectProgramsFromTx(tx);if(!CFG.AMM_PROGRAM_IDS.some(p=>progs.includes(p)))return;await handleFromTx(sig,tx);}}
 }
 
 /* ====================== Start ====================== */
 const app=express(); app.use(bodyParser.json({limit:'20mb'}));
 app.listen(CFG.PORT,()=>{
   info(`GMGN sniping listener on :${CFG.PORT}`);
-  const ws=new HeliusWS(CFG.HELIUS_WS_URL);
-  const programs=sanitizedProgramIds(CFG.AMM_PROGRAM_IDS);
-  if(!programs.length){err('❌ Aucun AMM_PROGRAM_IDS → aucun WS abonné'); return;}
+  const ws=new HeliusWS(CFG.HELIUS_WS_URL); const programs=sanitizedProgramIds(CFG.AMM_PROGRAM_IDS);
+  if(!programs.length){err('❌ Aucun AMM_PROGRAM_IDS → rien n’est écouté');return;}
   ws.start(programs);
 });
