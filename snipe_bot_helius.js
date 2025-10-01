@@ -1,15 +1,10 @@
 /**
- * snipe_bot_ws_raw_gmgn.js — v4 (WS-first, HTTP minimal & maîtrisé)
- *
- * - Détection ultra-rapide: Helius WebSocket logsSubscribe(mentions) sur AMM_PROGRAM_IDS (CSV)
- * - Anti-spam RPC: file HTTP (RPS plafonné + concurrence limitée + backoff 429 + retries confirmés)
- * - Garde-fous GMGN, mini Rug-guard, sortie au timeout, CSV
- * - Webhook raw & enhanced conservés (optionnels)
- *
- * ENV minimales:
- *   HELIUS_WS_URL=wss://mainnet.helius-rpc.com/?api-key=XXXX
- *   RPC_URL=https://mainnet.helius-rpc.com/?api-key=XXXX   (même clé OK)
- *   AMM_PROGRAM_IDS=pAMMBay...,CLMM...,675kPX...,whirl...,CAMMC...
+ * snipe_bot_ws_raw_gmgn.js — v4.1
+ * - WS Helius logsSubscribe(mentions) → signatures fraîches
+ * - Fetch TX: processed-first (ultra rapide) → fallback confirmed (anti “vieux age”)
+ * - Filtre “fresh liq / new pool” avant garde-fous (réduit le bruit des swaps)
+ * - File HTTP anti-429 (RPS/conc/backoff) + garde-fous GMGN + rug-guard + timeout
+ * - Webhook raw/enhanced conservés
  */
 
 import 'dotenv/config';
@@ -31,7 +26,7 @@ import {
 const CFG = {
   PORT: Number(process.env.PORT || 10000),
 
-  // RPC HTTP (Helius conseillé) — UNIQUEMENT pour lire la transaction APRES notif WS
+  // RPC HTTP utilisé UNIQUEMENT après notif WS
   RPC_URL: process.env.RPC_URL || 'https://api.mainnet-beta.solana.com',
 
   // WebSocket Helius
@@ -44,7 +39,7 @@ const CFG = {
 
   // Trade
   TRADE_SIZE_SOL: Number(process.env.TRADE_SIZE_SOL || 0.20),
-  MAX_SLIPPAGE: Number(process.env.MAX_SLIPPAGE || 0.30), // en %
+  MAX_SLIPPAGE: Number(process.env.MAX_SLIPPAGE || 0.30),
   PRIORITY_FEE_SOL: Number(process.env.PRIORITY_FEE_SOL || 0.006),
   ANTI_MEV: ['1','true','yes'].includes(String(process.env.ANTI_MEV || '').toLowerCase()),
 
@@ -71,19 +66,20 @@ const CFG = {
   CSV_FILE: process.env.CSV_FILE || 'live_trades.csv',
   LOG_LEVEL: (process.env.LOG_LEVEL || 'info').toLowerCase(),
 
-  // AMM program filters (CSV)
+  // AMM programs (CSV). Vide → fallback Pump AMM only
   AMM_PROGRAM_IDS: (process.env.AMM_PROGRAM_IDS || '')
     .split(',').map(s => s.trim()).filter(Boolean),
 
-  // File RPC HTTP (maîtrise du débit)
-  RPC_RPS: Number(process.env.RPC_RPS || 6),
-  RPC_MAX_CONCURRENCY: Number(process.env.RPC_MAX_CONCURRENCY || 2),
-  RPC_BACKOFF_MS: Number(process.env.RPC_BACKOFF_MS || 700),
+  // File RPC HTTP
+  RPC_RPS: Number(process.env.RPC_RPS || 8),
+  RPC_MAX_CONCURRENCY: Number(process.env.RPC_MAX_CONCURRENCY || 3),
+  RPC_BACKOFF_MS: Number(process.env.RPC_BACKOFF_MS || 600),
 
-  // Retrys (post logs) pour laisser la TX passer en confirmed
-  // => court & agressif pour rester dans la fenêtre 2–4s
-  TX_FETCH_RETRIES: Number(process.env.TX_FETCH_RETRIES || 4),
-  TX_FETCH_DELAY_MS: Number(process.env.TX_FETCH_DELAY_MS || 140),
+  // Retries pour getTransaction (fast path)
+  // 2 × processed (ultra rapide), 3 × confirmed (si nécessaire)
+  TX_PROCESSED_RETRIES: Number(process.env.TX_PROCESSED_RETRIES || 2),
+  TX_CONFIRMED_RETRIES: Number(process.env.TX_CONFIRMED_RETRIES || 3),
+  TX_FETCH_DELAY_MS: Number(process.env.TX_FETCH_DELAY_MS || 120),
 };
 
 const dbg  = (...a) => { if (CFG.LOG_LEVEL === 'debug') console.log(...a); };
@@ -100,7 +96,7 @@ const csv = (r) => {
   fs.appendFileSync(CFG.CSV_FILE, line);
 };
 
-/* ====================== Setup ====================== */
+/* ====================== Setup & utils ====================== */
 const connection = new Connection(CFG.RPC_URL, { commitment: 'processed' });
 const wallet = Keypair.fromSecretKey(bs58.decode(CFG.WALLET_SECRET_KEY));
 const WALLET_PK = wallet.publicKey.toBase58();
@@ -109,35 +105,26 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fmt = (n, d=6) => (typeof n === 'number' ? Number(n).toFixed(d) : n);
 const PK_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
-/* ====================== Anti-spam logs ====================== */
 const lastErr = new Map();
 function errOnce(key, ...msg) {
   const now = Date.now();
   const last = lastErr.get(key) || 0;
-  if (now - last > 1500) {
-    lastErr.set(key, now);
-    err(...msg);
-  } else {
-    dbg(...msg);
-  }
+  if (now - last > 1500) { lastErr.set(key, now); err(...msg); }
 }
 
-/* ====================== File HTTP (RPS + Concurrency + Backoff 429) ====================== */
+/* ====================== File HTTP (anti-429) ====================== */
 class HttpBucket {
   constructor({ rps, concurrency, backoffMs }) {
     this.interval = Math.max(1000 / Math.max(1, rps), 50);
     this.maxConc = Math.max(1, concurrency);
     this.baseBackoff = Math.max(100, backoffMs);
-    this.dynamicBackoff = 0; // backoff adaptatif
+    this.dynamicBackoff = 0;
     this.queue = [];
     this.running = 0;
     setInterval(() => this._drain(), this.interval);
   }
-  push(fn, tag='') {
-    return new Promise((resolve) => {
-      this.queue.push({ fn, resolve, tag });
-      this._drain();
-    });
+  push(fn) {
+    return new Promise((resolve) => { this.queue.push({ fn, resolve }); this._drain(); });
   }
   async _drain() {
     while (this.running < this.maxConc && this.queue.length) {
@@ -145,20 +132,17 @@ class HttpBucket {
       this.running++;
       (async () => {
         try {
-          // backoff adaptatif si nécessaire
           if (this.dynamicBackoff > 0) await sleep(this.dynamicBackoff);
           const out = await task.fn();
+          // détente progressive si OK
+          this.dynamicBackoff = Math.max(0, Math.floor(this.dynamicBackoff * 0.6));
           task.resolve(out);
         } catch (e) {
           const m = String(e?.message||'');
           if (m.includes('429') || m.includes('rate limited')) {
-            // augmente le backoff adaptatif (cap à 3s)
-            this.dynamicBackoff = Math.min(this.dynamicBackoff + this.baseBackoff, 3000);
+            this.dynamicBackoff = Math.min(this.dynamicBackoff + this.baseBackoff, 2500);
             errOnce('429', `429 rate-limited, retry in ${this.dynamicBackoff}ms`);
             await sleep(this.dynamicBackoff);
-          } else {
-            // baisse progressivement
-            this.dynamicBackoff = Math.max(0, Math.floor(this.dynamicBackoff * 0.6));
           }
           task.resolve(null);
         } finally {
@@ -174,14 +158,23 @@ const httpBucket = new HttpBucket({
   backoffMs: CFG.RPC_BACKOFF_MS,
 });
 
-async function getTransactionCautious(sig, attempts=CFG.TX_FETCH_RETRIES, delay=CFG.TX_FETCH_DELAY_MS) {
-  for (let i=0;i<attempts;i++) {
-    const res = await httpBucket.push(
-      () => connection.getTransaction(sig, { commitment:'confirmed', maxSupportedTransactionVersion: 0 }),
-      'getTx:confirmed'
-    );
-    if (res) return res;
-    await sleep(delay);
+async function getTxOnce(sig, commitment) {
+  return await httpBucket.push(
+    () => connection.getTransaction(sig, { commitment, maxSupportedTransactionVersion: 0 })
+  );
+}
+
+// Fast path: processed → confirmed
+async function getTransactionFast(sig) {
+  for (let i=0;i<CFG.TX_PROCESSED_RETRIES;i++) {
+    const tx = await getTxOnce(sig, 'processed');
+    if (tx) return tx;
+    await sleep(CFG.TX_FETCH_DELAY_MS);
+  }
+  for (let i=0;i<CFG.TX_CONFIRMED_RETRIES;i++) {
+    const tx = await getTxOnce(sig, 'confirmed');
+    if (tx) return tx;
+    await sleep(CFG.TX_FETCH_DELAY_MS);
   }
   return null;
 }
@@ -218,6 +211,19 @@ function extractMintFromTx(tx) {
   return [...by.entries()].sort((a,b)=>b[1]-a[1])[0][0];
 }
 
+function looksLikeFreshPoolOrFirstLiq(tx) {
+  const pre = tx?.meta?.preTokenBalances || [];
+  const post = tx?.meta?.postTokenBalances || [];
+  if (!post?.length) return false;
+
+  // (a) il y a au moins un "post" sans "pre" correspondant
+  const newAccounts = post.some(p => !pre.find(x => x.accountIndex === p.accountIndex));
+  // (b) ou bien le nombre de balances token augmente
+  const countIncreased = (post.length > pre.length);
+
+  return newAccounts || countIncreased;
+}
+
 function collectProgramsFromTx(tx) {
   const seen = new Set();
   const keys = tx?.transaction?.message?.accountKeys || [];
@@ -234,7 +240,7 @@ function collectProgramsFromTx(tx) {
   return [...seen];
 }
 
-/* ====================== GMGN helpers & guards ====================== */
+/* ====================== GMGN helpers & guards (inchangé) ====================== */
 async function gmgnGetRoute({ tokenIn, tokenOut, inLamports, fromAddress, slippagePct, feeSol, isAntiMev=false }) {
   const params = new URLSearchParams({
     token_in_address: tokenIn,
@@ -278,14 +284,12 @@ async function gmgnCheckStatus({ hash, lastValidBlockHeight }) {
   }
   return data.data;
 }
-
 function ratioOutOverIn(quote) {
   const out = Number(quote?.outAmount || 0);
   const inp = Number(quote?.inAmount || 0);
   if (inp <= 0) return 0;
   return out / inp;
 }
-
 function assertRouteGuards(routeData) {
   const q = routeData.quote || {};
   const impactPct = Number(q?.priceImpactPct || 0) * 100;
@@ -309,7 +313,7 @@ function assertRouteGuards(routeData) {
   }
 }
 
-/* ====================== BUY / SELL ====================== */
+/* ====================== BUY / SELL (identique) ====================== */
 async function buyViaGMGN(mint) {
   const inLamports = Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL);
   const route = await gmgnGetRoute({
@@ -402,58 +406,24 @@ async function sellAllViaGMGN(mint) {
   return { route, hash: submit.hash };
 }
 
-/* ====================== RUG GUARD ====================== */
-async function rugGuardAfterBuy({ mint, entryRatio }) {
-  if (CFG.RUG_GUARD_WINDOW_MS <= 0) return;
-  const t0 = Date.now();
-  const probeIn = Math.max(1, Math.floor(0.01 * LAMPORTS_PER_SOL));
-  while (Date.now() - t0 < CFG.RUG_GUARD_WINDOW_MS) {
-    try {
-      const probe = await gmgnGetRoute({
-        tokenIn: CFG.BASE_SOL_MINT,
-        tokenOut: mint,
-        inLamports: probeIn,
-        fromAddress: WALLET_PK,
-        slippagePct: CFG.MAX_SLIPPAGE,
-        feeSol: CFG.PRIORITY_FEE_SOL,
-        isAntiMev: CFG.ANTI_MEV,
-      });
-      const imp = Number(probe.quote?.priceImpactPct || 0) * 100;
-      const ratio = ratioOutOverIn(probe.quote);
-      if (entryRatio > 0) {
-        const dropPct = (1 - (ratio / entryRatio)) * 100;
-        if (dropPct >= CFG.RUG_DROP_PCT) {
-          warn(`[RUG] drop ${dropPct.toFixed(1)}% ≥ ${CFG.RUG_DROP_PCT}% → SELL NOW`);
-          await sellAllViaGMGN(mint);
-          return;
-        }
-      }
-      if (imp > Math.max(45, CFG.MAX_PRICE_IMPACT_PCT + 20)) {
-        warn(`[RUG] impact ${imp.toFixed(1)}% → SELL NOW`);
-        await sellAllViaGMGN(mint);
-        return;
-      }
-    } catch(e) {
-      warn('[RUG] probe error:', e.message);
-    }
-    await sleep(250);
-  }
-}
-
-/* ====================== Handler (depuis TX confirmée) ====================== */
-const seenMint = new Map();     // anti-refire 30s par mint
-const seenSig = new Set();      // anti-doublon WS
+/* ====================== Handler (avec filtre “fresh liq”) ====================== */
+const seenMint = new Map();
+const seenSig  = new Set();
 setInterval(() => { if (seenSig.size > 4000) seenSig.clear(); }, 120000);
 
 async function handleFromTx(sig, tx) {
+  // Heuristique anti-swaps: ne garder que les tx qui ressemblent à un "fresh liq / new pool"
+  if (!looksLikeFreshPoolOrFirstLiq(tx)) {
+    info(`[SKIP] not fresh-liq sig=${sig}`);
+    return;
+  }
+
   const mint  = extractMintFromTx(tx);
   if (!mint) { info(`[SKIP] no mint extracted sig=${sig}`); return; }
 
   const added = estimateSolAddedFromTx(tx);
   const age   = poolAgeFromTxMs(tx);
   const progs = collectProgramsFromTx(tx);
-
-  // heuristique source
   const src = progs.includes('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA') ? 'PUMP_AMM' : 'unknown';
   const minSol = (src === 'PUMP_AMM') ? CFG.PUMP_TRIGGER_MIN_SOL : CFG.TRIGGER_MIN_SOL;
 
@@ -479,7 +449,10 @@ async function handleFromTx(sig, tx) {
     const { route } = await buyViaGMGN(mint);
     const entryRatio = ratioOutOverIn(route.quote) || 0;
 
-    rugGuardAfterBuy({ mint, entryRatio }).catch(()=>{});
+    (async () => {
+      try { await rugGuardAfterBuy({ mint, entryRatio }); } catch {}
+    })();
+
     if (CFG.EXIT_TIMEOUT_MS > 0) {
       setTimeout(async () => {
         info(`⏳ Timeout ${CFG.EXIT_TIMEOUT_MS}ms → SELL ALL ${mint}`);
@@ -491,7 +464,7 @@ async function handleFromTx(sig, tx) {
   }
 }
 
-/* ====================== Helius WS client (logsSubscribe + queue TX) ====================== */
+/* ====================== WS client ====================== */
 function sanitizedProgramIds(list) {
   const out = [];
   for (const raw of list) {
@@ -503,44 +476,31 @@ function sanitizedProgramIds(list) {
   return out;
 }
 
-const METRICS = { wsLogs:0, txQueued:0, txFetched:0, lastSigAt:0 };
+const METRICS = { wsLogs:0, queued:0, fetched:0, lastSigAt:0 };
 
 class HeliusWS {
   constructor(url) {
     this.url = url;
     this.ws = null;
-    this.subs = new Map();
     this.pinger = null;
     this.reconnTimer = null;
     this.nextId = 1;
-
-    this.txQueue = [];             // signatures à traiter
+    this.txQueue = [];
     this.maxQueue = 800;
-    this.queueTimer = null;
   }
 
   start(programs) {
     this._connect(programs);
-    // drain queue à cadence maîtrisée (et confirmer côté RPC)
-    this.queueTimer = setInterval(() => this._drainQueue(), 80);
-  }
-
-  stop() {
-    try { this.ws?.close(); } catch {}
-    clearInterval(this.pinger);
-    clearInterval(this.queueTimer);
-    clearTimeout(this.reconnTimer);
+    setInterval(() => this._drainQueue(), 70); // cadence soutenue
   }
 
   _connect(programs) {
     this.ws = new WebSocket(this.url);
     this.ws.on('open', () => {
       info('WS connected:', this.url);
-      // (re)subscribe
-      for (const id of programs) this.logsSubscribeMentions(id, 'processed');
-      // keep-alive ping
+      for (const id of programs) this._logsSub(id, 'processed');
       clearInterval(this.pinger);
-      this.pinger = setInterval(() => { try { this.ws?.ping?.(); } catch{} }, 45000);
+      this.pinger = setInterval(() => { try { this.ws?.ping?.(); } catch {} }, 45000);
     });
     this.ws.on('message', (d) => this._onMessage(d));
     this.ws.on('close', () => {
@@ -552,95 +512,66 @@ class HeliusWS {
     this.ws.on('error', (e) => errOnce('ws', 'WS error:', e.message));
   }
 
-  _send(obj) {
-    try { this.ws?.send(JSON.stringify(obj)); } catch (e) { errOnce('wsSend', e.message); }
-  }
+  _send(obj) { try { this.ws?.send(JSON.stringify(obj)); } catch (e) { errOnce('wsSend', e.message); } }
 
-  logsSubscribeMentions(pubkey, commitment='processed') {
-    const id = this.nextId++;
-    const payload = {
-      jsonrpc: '2.0',
-      id,
-      method: 'logsSubscribe',
-      params: [{ mentions: [pubkey] }, { commitment }],
-    };
-    this.subs.set(`logs:${pubkey}`, payload);
+  _logsSub(pubkey, commitment) {
+    const payload = { jsonrpc:'2.0', id:this.nextId++, method:'logsSubscribe',
+      params: [{ mentions:[pubkey] }, { commitment }] };
     this._send(payload);
     info(`WS logs listener started (mentions): ${pubkey}`);
   }
 
-  _enqueueSig(sig) {
+  _enqueue(sig) {
     if (!sig || seenSig.has(sig)) return;
     seenSig.add(sig);
     if (this.txQueue.length >= this.maxQueue) this.txQueue.shift();
-    this.txQueue.push({ sig, enq: Date.now(), tries: 0 });
-    METRICS.txQueued++;
-    METRICS.lastSigAt = Date.now();
+    this.txQueue.push({ sig, enq: Date.now() });
+    METRICS.queued++; METRICS.lastSigAt = Date.now();
   }
 
   async _drainQueue() {
     if (!this.txQueue.length) return;
-    // sort: les plus récents en premier
+    // LIFO léger: traite en priorité les plus récents
     this.txQueue.sort((a,b) => b.enq - a.enq);
-
-    // traite 1 à 2 signatures par tick selon la backpressure HTTP
     const batch = this.txQueue.splice(0, Math.min(2, this.txQueue.length));
     for (const job of batch) {
-      try {
-        const tx = await getTransactionCautious(job.sig);
-        if (!tx) {
-          // requeue si peu d'essais (garde court pour ne pas sortir de la fenêtre 2–4s)
-          if (job.tries < CFG.TX_FETCH_RETRIES) {
-            job.tries++; job.enq = Date.now();
-            this.txQueue.push(job);
-          } else {
-            dbg('[WS] getTransaction miss sig=', job.sig);
-          }
-          continue;
-        }
-        METRICS.txFetched++;
-        await handleFromTx(job.sig, tx);
-      } catch(e) {
-        dbg('drainQueue error:', e.message);
-      }
+      const tx = await getTransactionFast(job.sig);
+      if (!tx) continue;
+      METRICS.fetched++;
+      await handleFromTx(job.sig, tx);
     }
   }
 
   async _onMessage(data) {
-    let msg = null;
-    try { msg = JSON.parse(String(data)); } catch { return; }
-
+    let msg = null; try { msg = JSON.parse(String(data)); } catch { return; }
     if (msg?.method === 'logsNotification') {
       const sig = msg?.params?.result?.value?.signature;
       if (!sig) return;
       METRICS.wsLogs++;
-      this._enqueueSig(sig);
-      dbg(`[WS] logs sig=${sig}`);
+      this._enqueue(sig);
+      dbg('[WS] sig', sig);
     }
   }
 }
 
 /* ====================== Webhook (raw + enhanced) ====================== */
 const app = express();
-app.use(bodyParser.json({ limit: '20mb' }));
+app.use(bodyParser.json({ limit:'20mb' }));
 
 app.post('/helius-webhook', async (req, res) => {
   try {
-    // RAW: {signature:"..."} ou body string
     if (req.body && (req.body.signature || req.body.txSig || typeof req.body === 'string')) {
       const sig = req.body.signature || req.body.txSig || (typeof req.body === 'string' ? req.body : null);
       info('RAW webhook sig:', sig);
-      const tx = await getTransactionCautious(sig);
+      const tx = await getTransactionFast(sig);
       if (!tx) return res.status(200).send({ ok:true, note:'tx-not-found', sig });
       await handleFromTx(sig, tx);
       return res.status(200).send({ ok:true, processed:true, sig });
     }
-
-    // Enhanced (si tu renvoies celles de Helius)
     const payload = Array.isArray(req.body) ? req.body[0] : req.body;
     const sig = payload?.signature || payload?.transaction?.signatures?.[0];
     if (!sig) return res.status(200).send({ ok:true, note:'no-signature' });
-    const tx = await getTransactionCautious(sig);
+    const tx = await getTransactionFast(sig);
     if (!tx) return res.status(200).send({ ok:true, note:'tx-not-found', sig });
     await handleFromTx(sig, tx);
     return res.status(200).send({ ok:true, processed:true, sig });
@@ -682,8 +613,7 @@ app.listen(CFG.PORT, () => {
   const ws = new HeliusWS(CFG.HELIUS_WS_URL);
   ws.start(programs);
 
-  // Heartbeat toutes les 15s
   setInterval(() => {
-    info(`[HB] wsLogs=${METRICS.wsLogs} queued=${ws.txQueue.length} fetched=${METRICS.txFetched} lastSigAgo=${METRICS.lastSigAt? (Date.now()-METRICS.lastSigAt)+'ms' : 'n/a'}`);
+    info(`[HB] wsLogs=${METRICS.wsLogs} queued=${ws.txQueue.length} fetched=${METRICS.fetched} lastSigAgo=${METRICS.lastSigAt? (Date.now()-METRICS.lastSigAt)+'ms' : 'n/a'}`);
   }, 15000);
 });
