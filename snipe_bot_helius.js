@@ -94,6 +94,22 @@ function errOnce(key, ...msg) {
   }
 }
 
+// --- Telemetry counters & heartbeat ---
+const METRICS = {
+  wsLogsSeen: 0,
+  sigSubs: 0,
+  sigConfirmed: 0,
+  txFetched: 0,
+  lastSigTs: 0,
+};
+setInterval(() => {
+  info(
+    `[HB] wsLogs=${METRICS.wsLogsSeen} sigSubs=${METRICS.sigSubs} ` +
+    `sigConf=${METRICS.sigConfirmed} txFetched=${METRICS.txFetched} ` +
+    `lastSig=${METRICS.lastSigTs ? (Date.now()-METRICS.lastSigTs)+'ms' : 'n/a'}`
+  );
+}, 15000);
+
 if (!CFG.WALLET_SECRET_KEY) { err('❌ WALLET_SECRET_KEY manquant'); process.exit(1); }
 if (!CFG.HELIUS_WS_URL) { err('❌ HELIUS_WS_URL manquant'); process.exit(1); }
 
@@ -425,31 +441,38 @@ async function rugGuardAfterBuy({ mint, entryRatio }) {
 const seenMint = new Map();           // anti-refire 30s
 async function handleFromTx(sig, tx) {
   const mint = extractMintFromTx(tx);
-  if (!mint) { dbg('skip: no mint'); return; }
+  if (!mint) { info(`[SKIP] no mint extracted sig=${sig}`); return; }
 
   const added = estimateSolAddedFromTx(tx);
   const age = poolAgeFromTxMs(tx);
   const progs = collectProgramsFromTx(tx);
   const src = progs.includes('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA') ? 'PUMP_AMM' : 'unknown';
 
+  const minSol = (src === 'PUMP_AMM') ? CFG.PUMP_TRIGGER_MIN_SOL : CFG.TRIGGER_MIN_SOL;
+
+  if (age != null && age > CFG.MAX_POOL_AGE_MS) {
+    info(`[SKIP] old pool (${age}ms > ${CFG.MAX_POOL_AGE_MS}) mint=${mint} src=${src} sig=${sig}`);
+    return;
+  }
+  if (added < minSol) {
+    info(`[SKIP] below-threshold (${fmt(added)} < ${minSol}) mint=${mint} src=${src} sig=${sig}`);
+    return;
+  }
+
   info(`🚀 token=${mint} | src=${src} | added≈${fmt(added)} SOL | age=${age==null?'n/a':age+'ms'} sig=${sig}`);
 
-  const minSol = (src === 'PUMP_AMM') ? CFG.PUMP_TRIGGER_MIN_SOL : CFG.TRIGGER_MIN_SOL;
-  if (age != null && age > CFG.MAX_POOL_AGE_MS) return;
-  if (added < minSol) return;
-
   const now = Date.now();
-  if (seenMint.get(mint) && now - seenMint.get(mint) < 30000) return;
+  if (seenMint.get(mint) && now - seenMint.get(mint) < 30000) {
+    info(`[SKIP] cooldown 30s mint=${mint} sig=${sig}`);
+    return;
+  }
   seenMint.set(mint, now);
 
   try {
     const { route } = await buyViaGMGN(mint);
     const entryRatio = ratioOutOverIn(route.quote) || 0;
 
-    // rug guard async
     rugGuardAfterBuy({ mint, entryRatio }).catch(()=>{});
-
-    // timeout sortie
     if (CFG.EXIT_TIMEOUT_MS > 0) {
       setTimeout(async () => {
         info(`⏳ Timeout ${CFG.EXIT_TIMEOUT_MS}ms → SELL ALL ${mint}`);
@@ -460,6 +483,7 @@ async function handleFromTx(sig, tx) {
     err('Buy failed:', e.message);
   }
 }
+
 
 /* ====================== Helius WS client ====================== */
 function sanitizedProgramIds(list) {
@@ -543,17 +567,21 @@ class HeliusWS {
     if (msg?.method === 'logsNotification') {
       const sig = msg?.params?.result?.value?.signature;
       if (!sig) return;
-      // on demande la confirmation via signatureSubscribe (zero http polling)
+      METRICS.wsLogsSeen++; METRICS.sigSubs++; METRICS.lastSigTs = Date.now();
+      info(`[WS] logs sig=${sig} → subscribe for confirmation`);
       this.signatureSubscribe(sig, 'confirmed');
     }
+    
     if (msg?.method === 'signatureNotification') {
-      const sig   = msg?.params?.result?.value?.signature || msg?.params?.result?.signature;
-      const errV  = msg?.params?.result?.value?.err ?? msg?.params?.result?.err ?? null;
+      const sig = msg?.params?.result?.value?.signature || msg?.params?.result?.signature;
+      const errV = msg?.params?.result?.value?.err ?? msg?.params?.result?.err ?? null;
       if (!sig) return;
-      if (errV) return; // tx failed, ignore
-      // maintenant un seul getTransaction(confirmed)
+      if (errV) { info(`[WS] signature FAILED sig=${sig}`); return; }
+      METRICS.sigConfirmed++;
+      info(`[WS] signature CONFIRMED sig=${sig}`);
       const tx = await getTransactionOnce(sig, 'confirmed');
-      if (!tx) return;
+      if (!tx) { info(`[WS] getTransaction miss sig=${sig}`); return; }
+      METRICS.txFetched++;
       await handleFromTx(sig, tx);
     }
   }
