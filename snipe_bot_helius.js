@@ -13,7 +13,6 @@ import bodyParser from 'body-parser';
 import fetch from 'node-fetch';
 import fs from 'fs';
 import bs58 from 'bs58';
-import { PublicKey } from '@solana/web3.js';
 import {
   Connection,
   PublicKey,
@@ -266,6 +265,7 @@ async function buyViaGMGN(mint) {
   const submit = await gmgnSubmitSignedTx(signed, CFG.ANTI_MEV);
 
   info(`[BUY] …pending hash=${submit.hash} r=${fmt(ratioOutOverIn(route.quote),6)}`);
+
   csv({ event:'enter', side:'BUY', sol:CFG.TRADE_SIZE_SOL, token:mint, extra:`hash=${submit.hash}` });
 
   (async () => {
