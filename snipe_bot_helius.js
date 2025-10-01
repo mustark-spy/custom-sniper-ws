@@ -72,6 +72,8 @@ const CFG = {
     .split(',').map(s => s.trim()).filter(Boolean),
 
   // Motifs logs considérés comme "créa pool / add liq"
+  WS_REQUIRE_PATTERN: ['1','true','yes'].includes(String(process.env.WS_REQUIRE_PATTERN || 'true').toLowerCase()),
+  
   POOL_LOG_PATTERNS: (process.env.POOL_LOG_PATTERNS || [
     'CreatePool', 'createPool',
     'InitializePool', 'initialize_pool', 'initializePool',
@@ -411,6 +413,7 @@ function sanitizedProgramIds(list) {
   }
   return out;
 }
+
 const LOG_RE = new RegExp(CFG.POOL_LOG_PATTERNS, 'i');
 
 class HeliusWS {
@@ -468,12 +471,12 @@ class HeliusWS {
       const sig = res?.signature;
       const logs = res?.logs || [];
       if (!sig || !Array.isArray(logs) || logs.length === 0) return;
-
-      // 🔎 ne retient que si le log match nos motifs (CreatePool/AddLiquidity/InitializePool…)
-      const hit = logs.some(line => LOG_RE.test(line));
-      if (!hit) { dbg('[WS] skip logs (no pattern match) sig=', sig); return; }
-
-      info(`[WS] logs match → subscribe for confirmation sig=${sig}`);
+    
+      if (CFG.WS_REQUIRE_PATTERN) {
+        const hit = logs.some(line => LOG_RE.test(line));
+        if (!hit) { dbg('[WS] skip logs (no pattern match) sig=', sig); return; }
+      }
+      info(`[WS] logs ${CFG.WS_REQUIRE_PATTERN ? 'match' : 'seen'} → subscribe for confirmation sig=${sig}`);
       this.signatureSubscribe(sig, 'confirmed');
       return;
     }
