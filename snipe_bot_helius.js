@@ -1,10 +1,10 @@
 /**
- * snipe_bot_ws_raw_gmgn.js — v2.1 (WS + webhook raw/enhanced → GMGN)
- * - WebSocket filtré par AMM (via AMM_PROGRAM_IDS)
- * - Rate-limit RPC (concurrency + RPS + backoff 429)
- * - Attente courte de confirmation avant getTransaction
- * - Garde-fous route, mini rug-guard, timeout exit
- * - Logs propres + CSV
+ * snipe_bot_ws_raw_gmgn.js — v3
+ * WS logs + Webhook (raw/enhanced) → GMGN router (sign local + txproxy)
+ * - Rate limit & backoff RPC (anti-429)
+ * - Concurrency cap
+ * - Anti-backlog WS (slots anciens ignorés)
+ * - Garde-fous route, rug-guard, timeout exit
  */
 
 import 'dotenv/config';
@@ -26,7 +26,7 @@ const CFG = {
   PORT: Number(process.env.PORT || 10000),
   RPC_URL: process.env.RPC_URL || 'https://api.mainnet-beta.solana.com',
 
-  // Filtres d’entrée
+  // Entrée
   MAX_POOL_AGE_MS: Number(process.env.MAX_POOL_AGE_MS || 2500),
   TRIGGER_MIN_SOL: Number(process.env.TRIGGER_MIN_SOL || 200),
   PUMP_TRIGGER_MIN_SOL: Number(process.env.PUMP_TRIGGER_MIN_SOL || 350),
@@ -40,7 +40,7 @@ const CFG = {
   // Sortie
   EXIT_TIMEOUT_MS: Number(process.env.EXIT_TIMEOUT_MS || 15000),
 
-  // Garde-fous route (GMGN)
+  // Garde-fous route
   MAX_PRICE_IMPACT_PCT: Number(process.env.MAX_PRICE_IMPACT_PCT || 22),
   MIN_OTHER_OVER_OUT: Number(process.env.MIN_OTHER_OVER_OUT || 0.965),
   MIN_OUT_PER_SOL: Number(process.env.MIN_OUT_PER_SOL || 0),
@@ -52,22 +52,22 @@ const CFG = {
   // GMGN
   GMGN_HOST: process.env.GMGN_HOST || 'https://gmgn.ai',
 
-  // Wallet & base mint
+  // Wallet
   WALLET_SECRET_KEY: process.env.WALLET_SECRET_KEY || '',
   BASE_SOL_MINT: 'So11111111111111111111111111111111111111112',
 
-  // Logs/CSV
+  // Logs
   CSV_FILE: process.env.CSV_FILE || 'live_trades.csv',
   LOG_LEVEL: (process.env.LOG_LEVEL || 'info').toLowerCase(),
 
-  // Filtre WS par programmes (CSV). Vide → "all"
+  // WS: filtrage par programmes (mentions)
   AMM_PROGRAM_IDS: (process.env.AMM_PROGRAM_IDS || '')
     .split(',').map(s => s.trim()).filter(Boolean),
 
-  // --- RPC rate limit ---
-  RPC_MAX_CONCURRENCY: Number(process.env.RPC_MAX_CONCURRENCY || 3), // appels HTTP en parallèle
-  RPC_RPS: Number(process.env.RPC_RPS || 8),                          // requêtes/seconde max
-  RPC_BACKOFF_MS: Number(process.env.RPC_BACKOFF_MS || 600),          // backoff de base si 429
+  // Anti-429 / perf RPC
+  RPC_RPS: Number(process.env.RPC_RPS || 8),                 // budget req/s
+  RPC_MAX_CONCURRENCY: Number(process.env.RPC_MAX_CONCURRENCY || 3),
+  RPC_BACKOFF_MS: Number(process.env.RPC_BACKOFF_MS || 600), // backoff 429
 };
 
 /* ====================== Logger ====================== */
@@ -89,6 +89,7 @@ function errOnce(key, ...msg) {
   }
 }
 
+/* ====================== Setup ====================== */
 if (!CFG.WALLET_SECRET_KEY) { err('❌ WALLET_SECRET_KEY manquant'); process.exit(1); }
 if (!CFG.GMGN_HOST) { err('❌ GMGN_HOST manquant'); process.exit(1); }
 
@@ -98,8 +99,6 @@ const csv = (r) => {
   fs.appendFileSync(CFG.CSV_FILE, line);
 };
 
-/* ====================== Setup ====================== */
-// Connexion en processed pour la vitesse (WS) ; getTransaction passera par wrapper avec confirmed/finalized.
 const connection = new Connection(CFG.RPC_URL, { commitment: 'processed' });
 const wallet = Keypair.fromSecretKey(bs58.decode(CFG.WALLET_SECRET_KEY));
 const WALLET_PK = wallet.publicKey.toBase58();
@@ -107,66 +106,31 @@ const WALLET_PK = wallet.publicKey.toBase58();
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fmt = (n, d=6) => (typeof n === 'number' ? Number(n).toFixed(d) : n);
 
-/* ---------- RPC limiter (concurrency + RPS + 429 backoff) ---------- */
-let running = 0;
-let tokens = 0;
-let lastRefill = Date.now();
-const queue = [];
+/* ====================== Simple RPC rate-limiter ====================== */
+// Token-bucket + concurrency cap
+let tokens = CFG.RPC_RPS;
+let inFlight = 0;
+setInterval(() => { tokens = CFG.RPC_RPS; }, 1000);
 
-function refillTokens() {
-  const now = Date.now();
-  const elapsed = now - lastRefill;
-  const add = Math.floor((elapsed / 1000) * CFG.RPC_RPS);
-  if (add > 0) {
-    tokens = Math.min(tokens + add, CFG.RPC_RPS);
-    lastRefill = now;
-  }
-}
-function tryDequeue() {
-  refillTokens();
-  while (running < CFG.RPC_MAX_CONCURRENCY && tokens > 0 && queue.length) {
-    tokens--;
-    const job = queue.shift();
-    running++;
-    job();
-  }
-}
-async function scheduleRpc(fn) {
-  return new Promise((resolve, reject) => {
-    const run = async () => {
-      try {
-        const res = await fn();
-        resolve(res);
-      } catch (e) {
-        reject(e);
-      } finally {
-        running--;
-        tryDequeue();
-      }
-    };
-    queue.push(run);
-    tryDequeue();
-  });
-}
-// Wrapper général avec gestion 429
-async function rpcCall(label, fn, { retries = 3 } = {}) {
-  let attempt = 0;
-  // exécute via rate-limiter
-  while (true) {
-    try {
-      return await scheduleRpc(fn);
-    } catch (e) {
-      const msg = String(e?.message || e);
-      const is429 = msg.includes('429') || msg.includes('Too Many Requests');
-      if (is429 && attempt < retries) {
-        attempt++;
-        const wait = CFG.RPC_BACKOFF_MS * attempt; // backoff linéaire
-        dbg(`${label}: 429 → backoff ${wait}ms (attempt ${attempt}/${retries})`);
-        await sleep(wait);
-        continue;
-      }
-      throw e;
+async function withRpcBudget(fn, label='rpc') {
+  // concurrency gate
+  while (inFlight >= CFG.RPC_MAX_CONCURRENCY) await sleep(5);
+  // token gate
+  while (tokens <= 0) await sleep(5);
+  tokens--;
+  inFlight++;
+  try {
+    return await fn();
+  } catch (e) {
+    // backoff on 429
+    const m = String(e?.message || '');
+    if (m.includes('429') || m.includes('Too Many Requests')) {
+      errOnce('429', 'Server responded with 429 Too Many Requests. Retrying after', CFG.RPC_BACKOFF_MS, 'ms...');
+      await sleep(CFG.RPC_BACKOFF_MS);
     }
+    throw e;
+  } finally {
+    inFlight--;
   }
 }
 
@@ -183,11 +147,10 @@ function poolAgeMs(payload) {
 }
 function estimateSolAdded(payload) {
   const solMint = CFG.BASE_SOL_MINT;
-  const t = payload?.tokenTransfers || [];
+  const tt = payload?.tokenTransfers || [];
   let by = 0;
-  for (const x of t) if (x.mint === solMint && x.tokenAmount > 0) by += Number(x.tokenAmount);
+  for (const x of tt) if (x.mint === solMint && x.tokenAmount > 0) by += Number(x.tokenAmount);
   if (by > 0) return by;
-  // fallback balances
   const pre = payload?.meta?.preBalances || [];
   const post = payload?.meta?.postBalances || [];
   if (pre.length && post.length) {
@@ -211,7 +174,6 @@ function extractMint(payload) {
     }
   }
   if (deltas.size) return [...deltas.entries()].sort((a,b)=>b[1]-a[1])[0][0];
-
   const pre = payload?.meta?.preTokenBalances || [];
   const post = payload?.meta?.postTokenBalances || [];
   const byMint = {};
@@ -363,13 +325,15 @@ async function buyViaGMGN(mint) {
 async function getTokenBalanceLamports(owner, mint) {
   const ownerPk = new PublicKey(owner);
   const mintPk  = new PublicKey(mint);
-  const resp = await rpcCall('getTokenAccountsByOwner',
-    () => connection.getTokenAccountsByOwner(ownerPk, { mint: mintPk })
+  const resp = await withRpcBudget(
+    () => connection.getTokenAccountsByOwner(ownerPk, { mint: mintPk }),
+    'getTokenAccountsByOwner'
   );
   let total = 0n;
   for (const it of resp.value) {
-    const acc = await rpcCall('getParsedAccountInfo',
-      () => connection.getParsedAccountInfo(it.pubkey)
+    const acc = await withRpcBudget(
+      () => connection.getParsedAccountInfo(it.pubkey),
+      'getParsedAccountInfo'
     );
     const amt = BigInt(acc.value?.data?.parsed?.info?.tokenAmount?.amount || '0');
     total += amt;
@@ -456,11 +420,13 @@ async function rugGuardAfterBuy({ mint, entryRatio }) {
 }
 
 /* ====================== Unified handler ====================== */
-const seenMint = new Map(); // anti-refire 30s par mint
-const seenSig  = new Set(); // anti-doublon WS
+const seenMint = new Map();     // anti-refire 30s
+const seenSig  = new Set();     // anti-dup WS
+let wsStartSlot = 0;            // anti-backlog
+
 setInterval(() => { if (seenSig.size > 4000) seenSig.clear(); }, 120000);
 
-async function handleDetected(payload, srcHint = 'unknown', extra = {}) {
+async function handleDetected(payload, srcHint='unknown', extra={}) {
   try {
     const t = payload?.type || 'UNKNOWN';
     const src = payload?.source || srcHint || 'unknown';
@@ -503,59 +469,55 @@ async function handleDetected(payload, srcHint = 'unknown', extra = {}) {
   }
 }
 
-/* ====================== Fetch tx — wait confirmed ====================== */
-async function waitSignatureConfirmed(sig, maxWaitMs = 1500, pollMs = 150) {
-  const t0 = Date.now();
-  while (Date.now() - t0 < maxWaitMs) {
-    try {
-      const st = await rpcCall('getSignatureStatuses',
-        () => connection.getSignatureStatuses([sig], { searchTransactionHistory: true })
-      );
-      const s = st?.value?.[0];
-      if (s?.err) return false;
-      const cs = s?.confirmationStatus;
-      const confs = s?.confirmations;
-      if (cs === 'confirmed' || cs === 'finalized' || (typeof confs === 'number' && confs >= 1)) return true;
-    } catch (e) {
-      errOnce('sigStatus', 'getSignatureStatuses err:', e.message);
-    }
-    await sleep(pollMs);
-  }
-  return false;
+/* ====================== Fetch tx — lean retries ====================== */
+async function getSigStatusOnce(sig) {
+  return await withRpcBudget(
+    () => connection.getSignatureStatuses([sig], { searchTransactionHistory: true }),
+    'getSignatureStatuses'
+  );
 }
 
-async function fetchTransactionConfirmed(sig) {
-  try {
-    const tx = await rpcCall('getTransaction(confirmed)',
-      () => connection.getTransaction(sig, { commitment:'confirmed', maxSupportedTransactionVersion: 0 })
-    );
-    if (tx) return tx;
-  } catch (e) {
-    errOnce('getTxConfirmed', e.message);
-  }
-  try {
-    const tx = await rpcCall('getTransaction(finalized)',
-      () => connection.getTransaction(sig, { commitment:'finalized', maxSupportedTransactionVersion: 0 })
-    );
-    if (tx) return tx;
-  } catch (e) {
-    errOnce('getTxFinalized', e.message);
-  }
-  return null;
+async function getTx(commitment) {
+  return async (sig) => await withRpcBudget(
+    () => connection.getTransaction(sig, { commitment, maxSupportedTransactionVersion: 0 }),
+    `getTransaction(${commitment})`
+  );
 }
+const getTxConfirmed = getTx('confirmed');
+const getTxFinalized = getTx('finalized');
 
+/**
+ * Politique "lean":
+ *  1) status 1x ; si pas confirmé → petite pause ; recheck 1x
+ *  2) si confirmé → getTransaction(confirmed), sinon 1 essai en finalized
+ */
 async function fetchTxAfterConfirmed(sig) {
-  const ok = await waitSignatureConfirmed(sig, 1500, 150);
-  if (!ok) return null;
-  return await fetchTransactionConfirmed(sig);
+  // 1er check
+  let st = await getSigStatusOnce(sig).catch(e => { errOnce('sigStatus', e.message); return null; });
+  let s  = st?.value?.[0];
+  if (s?.err) return null;
+
+  if (!s || (s.confirmationStatus !== 'confirmed' && s.confirmationStatus !== 'finalized' && (s.confirmations ?? 0) < 1)) {
+    await sleep(200); // petite attente
+    st = await getSigStatusOnce(sig).catch(e => { errOnce('sigStatus', e.message); return null; });
+    s  = st?.value?.[0];
+    if (!s || s?.err) return null;
+  }
+
+  // tx
+  let tx = await getTxConfirmed(sig).catch(e => { errOnce('getTxConfirmed', e.message); return null; });
+  if (!tx) tx = await getTxFinalized(sig).catch(e => { errOnce('getTxFinalized', e.message); return null; });
+  return tx;
 }
 
 /* ====================== WebSocket logs ====================== */
-function startLogsListener() {
+async function startLogsListener() {
   try {
+    wsStartSlot = await withRpcBudget(() => connection.getSlot('processed'), 'getSlot');
+    // Sans filtre → flux énorme. Utilise AMM_PROGRAM_IDS quand c’est possible.
     if (!CFG.AMM_PROGRAM_IDS.length) {
       connection.onLogs('all', onLogsHandler, 'processed');
-      info('WS logs listener started for ALL (⚠️ bruyant, conseille d’utiliser AMM_PROGRAM_IDS)');
+      info('WS logs listener started for all');
       return;
     }
     for (const id of CFG.AMM_PROGRAM_IDS) {
@@ -573,10 +535,13 @@ function startLogsListener() {
 }
 
 async function onLogsHandler(logInfo) {
-  const sig = logInfo?.signature;
+  const { signature: sig, slot } = (logInfo || {});
   if (!sig) return;
+
+  // Anti-backlog: on ignore les slots significativement antérieurs au slot courant
+  if (wsStartSlot && slot && slot < wsStartSlot - 2) { dbg('skip backlog slot', slot); return; }
+
   if (seenSig.has(sig)) return;
-  if (seenSig.size > 5000) seenSig.clear();
   seenSig.add(sig);
 
   const tx = await fetchTxAfterConfirmed(sig);
@@ -588,6 +553,7 @@ async function onLogsHandler(logInfo) {
     slot: tx.slot,
     timestamp: tx.blockTime || null,
   };
+
   const progs = collectProgramsFromTxPayload(payload);
   let src = 'unknown';
   if (progs.includes('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA')) src = 'PUMP_AMM';
@@ -601,7 +567,6 @@ app.use(bodyParser.json({ limit: '20mb' }));
 
 app.post('/helius-webhook', async (req, res) => {
   try {
-    // RAW: {signature:"..."} ou body string
     if (req.body && (req.body.signature || req.body.txSig || typeof req.body === 'string')) {
       const sig = req.body.signature || req.body.txSig || (typeof req.body === 'string' ? req.body : null);
       info('RAW webhook sig:', sig);
@@ -619,7 +584,6 @@ app.post('/helius-webhook', async (req, res) => {
       return res.status(200).send(r);
     }
 
-    // Enhanced Helius
     const payload = Array.isArray(req.body) ? req.body[0] : req.body;
     const t = payload?.type || 'UNKNOWN';
     const src = payload?.source || 'unknown';
@@ -648,7 +612,11 @@ app.get('/health', (_req, res) => res.send({
     antiMEV: CFG.ANTI_MEV,
     exitTimeoutMs: CFG.EXIT_TIMEOUT_MS,
     ammPrograms: CFG.AMM_PROGRAM_IDS,
-    rpcLimit: { maxConc: CFG.RPC_MAX_CONCURRENCY, rps: CFG.RPC_RPS, backoffMs: CFG.RPC_BACKOFF_MS },
+    rpc: {
+      rps: CFG.RPC_RPS,
+      maxConcurrency: CFG.RPC_MAX_CONCURRENCY,
+      backoffMs: CFG.RPC_BACKOFF_MS,
+    },
   },
 }));
 
