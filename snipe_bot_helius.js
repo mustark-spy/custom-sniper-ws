@@ -13,6 +13,7 @@ import bodyParser from 'body-parser';
 import fetch from 'node-fetch';
 import fs from 'fs';
 import bs58 from 'bs58';
+import { PublicKey } from '@solana/web3.js';
 import {
   Connection,
   PublicKey,
@@ -470,37 +471,50 @@ async function fetchTxAfterConfirmed(sig) {
 /* ====================== WebSocket logs ====================== */
 function startLogsListener() {
   try {
-    const targets = CFG.AMM_PROGRAM_IDS.length ? CFG.AMM_PROGRAM_IDS : ['all'];
-    for (const target of targets) {
-      connection.onLogs(target, async (logInfo) => {
-        const sig = logInfo?.signature;
-        if (!sig || seenSig.has(sig)) return;
-        seenSig.add(sig);
+    // If no filter -> one subscription to "all"
+    if (!CFG.AMM_PROGRAM_IDS.length) {
+      connection.onLogs('all', onLogsHandler, 'processed');
+      info('WS logs listener started for all');
+      return;
+    }
 
-        // Attendre confirmation courte, puis fetch tx en confirmed
-        const tx = await fetchTxAfterConfirmed(sig);
-        if (!tx) { dbg('tx not found for sig', sig); return; }
-
-        const payload = {
-          transaction: tx.transaction,
-          meta: tx.meta,
-          slot: tx.slot,
-          timestamp: tx.blockTime || null,
-        };
-
-        // source heuristic
-        const progs = collectProgramsFromTxPayload(payload);
-        let src = 'unknown';
-        if (progs.includes('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA')) src = 'PUMP_AMM';
-
-        await handleDetected(payload, src, { signature: sig });
-      }, 'processed');
-
-      info(`WS logs listener started for ${target}`);
+    // One subscription per programId (as PublicKey)
+    for (const id of CFG.AMM_PROGRAM_IDS) {
+      try {
+        const pk = new PublicKey(id);            // <-- ensure PublicKey
+        connection.onLogs(pk, onLogsHandler, 'processed');
+        info(`WS logs listener started for program (mentions): ${pk.toBase58()}`);
+      } catch (e) {
+        warn(`Invalid AMM program id in AMM_PROGRAM_IDS: ${id} → ${e.message}`);
+      }
     }
   } catch (e) {
     warn('startLogsListener failed:', e.message);
   }
+}
+
+// shared handler (unchanged from your version)
+async function onLogsHandler(logInfo) {
+  const sig = logInfo?.signature;
+  if (!sig || seenSig.has(sig)) return;
+  seenSig.add(sig);
+
+  const tx = await fetchTxAfterConfirmed(sig);
+  if (!tx) { dbg('tx not found for sig', sig); return; }
+
+  const payload = {
+    transaction: tx.transaction,
+    meta: tx.meta,
+    slot: tx.slot,
+    timestamp: tx.blockTime || null,
+  };
+
+  // quick source heuristic
+  const progs = collectProgramsFromTxPayload(payload);
+  let src = 'unknown';
+  if (progs.includes('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA')) src = 'PUMP_AMM';
+
+  await handleDetected(payload, src, { signature: sig });
 }
 
 /* ====================== Webhook (raw + enhanced) ====================== */
