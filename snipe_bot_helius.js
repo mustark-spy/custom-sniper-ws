@@ -474,6 +474,9 @@ class HeliusWS {
     this.pinger = null;
     this.reconnTimer = null;
     this.nextId = 1;
+    this.reqIdToSig = new Map();     // id de requête -> signature (avant que Helius renvoie le subId)
+    this.subIdToSig = new Map();     // id d’abonnement -> signature (pour les notifications)
+
   }
   start() { this._connect(); }
   stop() { try { this.ws?.close(); } catch{} clearInterval(this.pinger); clearTimeout(this.reconnTimer); }
@@ -508,39 +511,72 @@ class HeliusWS {
     info(`WS logs listener started (mentions): ${pubkey}`);
   }
 
-  signatureSubscribe(sig, commitment = CFG.SIGNATURE_COMMITMENT) {
+  signatureSubscribe(sig, commitment = 'processed') {
     const id = this.nextId++;
-    const payload = { jsonrpc: '2.0', id, method: 'signatureSubscribe', params: [sig, { commitment }] };
+    const payload = {
+      jsonrpc: '2.0',
+      id,
+      method: 'signatureSubscribe',
+      params: [sig, { commitment }],
+    };
+    // on mémorise la sig avec l'id de requête; Helius nous renverra ensuite un subId
+    this.reqIdToSig.set(id, sig);
     this._send(payload);
   }
-
+  
   async _onMessage(data) {
-    let msg = null; try { msg = JSON.parse(String(data)); } catch { return; }
-
+    let msg = null;
+    try { msg = JSON.parse(String(data)); } catch { return; }
+  
+    // 1) Réponse d'abonnement (nous donne le subId)
+    if (msg?.id && msg?.result && typeof msg.result === 'number') {
+      // Est-ce la réponse à un signatureSubscribe ?
+      const sig = this.reqIdToSig.get(msg.id);
+      if (sig) {
+        const subId = msg.result;
+        this.subIdToSig.set(subId, sig);
+        this.reqIdToSig.delete(msg.id);
+        return;
+      }
+    }
+  
+    // 2) logsNotification -> on filtre puis on souscrit à la signature
     if (msg?.method === 'logsNotification') {
       const res = msg?.params?.result?.value;
       const sig = res?.signature;
       const logs = res?.logs || [];
       if (!sig || !Array.isArray(logs) || logs.length === 0) return;
-
+  
       if (CFG.WS_REQUIRE_PATTERN) {
         const hit = logs.some(line => LOG_RE.test(line));
         if (!hit) { dbg('[WS] skip logs (no pattern match) sig=', sig); return; }
       }
       info(`[WS] logs ${CFG.WS_REQUIRE_PATTERN ? 'match' : 'seen'} → subscribe for confirmation sig=${sig}`);
-      this.signatureSubscribe(sig, CFG.SIGNATURE_COMMITMENT);
+      // souscrit en 'processed' pour gagner quelques centaines de ms
+      this.signatureSubscribe(sig, 'processed');
       return;
     }
-
+  
+    // 3) signatureNotification -> on récupère la sig via le subId puis on traite
     if (msg?.method === 'signatureNotification') {
-      const sig = msg?.params?.result?.value?.signature || msg?.params?.result?.signature;
+      const subId = msg?.params?.subscription;
+      const sig = this.subIdToSig.get(subId);
       const errV = msg?.params?.result?.value?.err ?? msg?.params?.result?.err ?? null;
-      if (!sig) return;
+  
+      if (!sig) { dbg('[WS] signatureNotification sans sig (subId inconnu)'); return; }
+  
+      // on peut se désabonner si tu veux (optionnel)
+      // this._send({ jsonrpc:'2.0', id:this.nextId++, method:'signatureUnsubscribe', params:[subId] });
+      this.subIdToSig.delete(subId);
+  
       if (errV) { dbg(`[WS] signature FAILED sig=${sig}`); return; }
-
-      const tx = await getTransactionOnce(sig, CFG.TX_FETCH_COMMITMENT);
-      if (!tx) { dbg(`[WS] getTransaction miss sig=${sig}`); return; }
+  
+      // récupère la TX le plus tôt possible
+      const tx = await getTransactionOnce(sig, 'processed'); // plus tôt
+      if (!tx) { dbg(`[WS] getTransaction miss (processed) sig=${sig}`); return; }
+  
       await handleFromTx(sig, tx);
+      return;
     }
   }
 }
