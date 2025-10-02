@@ -124,7 +124,7 @@ const csv = (r) => {
 };
 
 /* ====================== Setup ====================== */
-const connection = new Connection(CFG.RPC_URL, { commitment: 'processed' });
+const connection = new Connection(CFG.RPC_URL, { commitment: 'confirmed' });
 const wallet = Keypair.fromSecretKey(bs58.decode(CFG.WALLET_SECRET_KEY));
 const WALLET_PK = wallet.publicKey.toBase58();
 
@@ -182,11 +182,19 @@ const httpBucket = new HttpBucket({
   backoffMax: CFG.RPC_BACKOFF_MAX_MS,
 });
 
-async function getTransactionOnce(sig, commitment = CFG.TX_FETCH_COMMITMENT) {
-  return await httpBucket.push(
-    () => connection.getTransaction(sig, { commitment, maxSupportedTransactionVersion: 0 }),
-    `getTx:${commitment}`,
-  );
+async function getTransactionOnce(sig, commitment = 'confirmed') {
+ return await httpBucket.push(
+   () => connection.getTransaction(sig, { commitment, maxSupportedTransactionVersion: 0 }),
+   `getTx:${commitment}`,
+ );
+}
+
+async function getTransactionWithFallback(sig) {
+ let tx = await getTransactionOnce(sig, 'confirmed');
+ if (tx) return tx;
+ // one short wait, then try finalized (validators sometimes lag indexing at confirmed)
+ await sleep(250);
+ return await getTransactionOnce(sig, 'finalized');
 }
 
 /* ====================== Helpers extraction ====================== */
@@ -352,10 +360,12 @@ async function buyViaGMGN(mint, { startTs=Date.now() } = {}) {
 
 async function getTokenBalanceLamports(owner, mint) {
   const ownerPk = new PublicKey(owner); const mintPk  = new PublicKey(mint);
-  const resp = await connection.getTokenAccountsByOwner(ownerPk, { mint: mintPk });
+  //const resp = await connection.getTokenAccountsByOwner(ownerPk, { mint: mintPk });
+  const resp = await connection.getTokenAccountsByOwner(ownerPk, { mint: mintPk }, 'confirmed');
   let total = 0n;
   for (const it of resp.value) {
-    const acc = await connection.getParsedAccountInfo(it.pubkey);
+    //const acc = await connection.getParsedAccountInfo(it.pubkey);
+    const acc = await connection.getParsedAccountInfo(it.pubkey, 'confirmed');
     const amt = BigInt(acc.value?.data?.parsed?.info?.tokenAmount?.amount || '0');
     total += amt;
   }
@@ -572,8 +582,9 @@ class HeliusWS {
       if (errV) { dbg(`[WS] signature FAILED sig=${sig}`); return; }
   
       // récupère la TX le plus tôt possible
-      const tx = await getTransactionOnce(sig, 'processed'); // plus tôt
-      if (!tx) { dbg(`[WS] getTransaction miss (processed) sig=${sig}`); return; }
+      //const tx = await getTransactionOnce(sig, 'processed'); // plus tôt
+      const tx = await getTransactionWithFallback(sig);
+      if (!tx) { dbg(`[WS] getTransaction miss (confirmed) sig=${sig}`); return; }
   
       await handleFromTx(sig, tx);
       return;
@@ -591,7 +602,8 @@ app.post('/helius-webhook', async (req, res) => {
     if (req.body && (req.body.signature || req.body.txSig || typeof req.body === 'string')) {
       const sig = req.body.signature || req.body.txSig || (typeof req.body === 'string' ? req.body : null);
       info('RAW webhook sig:', sig);
-      const tx = await getTransactionOnce(sig, CFG.TX_FETCH_COMMITMENT);
+      //const tx = await getTransactionOnce(sig, CFG.TX_FETCH_COMMITMENT);
+      const tx = await getTransactionWithFallback(sig);
       if (!tx) return res.status(200).send({ ok:true, note:'tx-not-found', sig });
       await handleFromTx(sig, tx);
       return res.status(200).send({ ok:true, processed:true, sig });
@@ -599,7 +611,8 @@ app.post('/helius-webhook', async (req, res) => {
     const payload = Array.isArray(req.body) ? req.body[0] : req.body;
     const sig = payload?.signature || payload?.transaction?.signatures?.[0];
     if (!sig) return res.status(200).send({ ok:true, note:'no-signature' });
-    const tx = await getTransactionOnce(sig, CFG.TX_FETCH_COMMITMENT);
+    //const tx = await getTransactionOnce(sig, CFG.TX_FETCH_COMMITMENT);
+    const tx = await getTransactionWithFallback(sig);
     if (!tx) return res.status(200).send({ ok:true, note:'tx-not-found', sig });
     await handleFromTx(sig, tx);
     return res.status(200).send({ ok:true, processed:true, sig });
