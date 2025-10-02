@@ -36,7 +36,7 @@ const CFG = {
 
   // Commitments (plus tôt = 'processed')
   SIGNATURE_COMMITMENT: (process.env.SIGNATURE_COMMITMENT || 'processed'),
-  TX_FETCH_COMMITMENT: (process.env.TX_FETCH_COMMITMENT || 'processed'),
+  TX_FETCH_COMMITMENT: (process.env.TX_FETCH_COMMITMENT || 'confirmed'),
 
   // Filtres d'entrée
   MAX_POOL_AGE_MS: Number(process.env.MAX_POOL_AGE_MS || 2500),
@@ -243,44 +243,53 @@ function collectProgramsFromTx(tx) {
 /* ====================== GMGN helpers ====================== */
 async function gmgnGetRouteRaw(params) {
   const url = `${CFG.GMGN_HOST}/defi/router/v1/sol/tx/get_swap_route?${params.toString()}`;
-  const res = await fetch(url);
-  const data = await res.json().catch(()=> ({}));
-  return { ok: res.ok, data, status: res.status };
+  return await httpBucket.push(async () => {
+    const res = await fetch(url);
+    const data = await res.json().catch(() => ({}));
+    return { ok: res.ok, data, status: res.status };
+  }, 'gmgn:get_route');
 }
 
 async function gmgnGetRoute({ tokenIn, tokenOut, inLamports, fromAddress, slippagePct, feeSol, isAntiMev=false }) {
   const params = new URLSearchParams({
-    token_in_address: tokenIn, token_out_address: tokenOut,
-    in_amount: String(inLamports), from_address: fromAddress,
-    slippage: String(slippagePct * 100), swap_mode: 'ExactIn',
+    token_in_address: tokenIn,
+    token_out_address: tokenOut,
+    in_amount: String(inLamports),
+    from_address: fromAddress,
+    slippage: String(slippagePct * 100),
+    swap_mode: 'ExactIn',
   });
   if (feeSol && feeSol > 0) params.set('fee', String(feeSol));
   if (isAntiMev) params.set('is_anti_mev', 'true');
 
-  // EARLY PROBE LOOP
   const t0 = Date.now();
+  const maxMs = Math.max(200, CFG.EARLY_ROUTE_PROBE_MS);
+  const baseInt = Math.max(60, CFG.EARLY_ROUTE_PROBE_INTERVAL_MS);
   let lastErr = '';
-  while (true) {
+
+  while (Date.now() - t0 < maxMs) {
     const { ok, data, status } = await gmgnGetRouteRaw(params);
     const good = ok && data && data.code === 0 && data.data?.raw_tx?.swapTransaction;
     const outAmt = Number(data?.data?.quote?.outAmount || 0);
+
     if (good && outAmt > 0) return data.data;
 
+    // mémorise le dernier message pour l’erreur finale
     lastErr = `GMGN route invalid: ${JSON.stringify(data)} {status:${status}}`;
 
-    const elapsed = Date.now() - t0;
-    if (elapsed >= CFG.EARLY_ROUTE_PROBE_MS) break;
-    // Cas typiques à patienter : "little pool hit (v2)" / out=0
+    // cas attendus en pré-ouverture → petit retry rapide avec jitter
     const msg = String(data?.msg || '').toLowerCase();
     if (msg.includes('little pool') || outAmt === 0) {
-      await sleep(CFG.EARLY_ROUTE_PROBE_INTERVAL_MS);
+      const jitter = Math.floor(Math.random() * 50); // 0-50ms pour désync
+      await sleep(baseInt + jitter);
       continue;
     }
-    // autres erreurs → inutile d’insister
+    // autre erreur → inutile d’insister
     break;
   }
   throw new Error(lastErr);
 }
+
 
 async function gmgnSubmitSignedTx(base64Signed, isAntiMev=false) {
   const body = { chain: 'sol', signedTx: base64Signed };
@@ -306,10 +315,10 @@ function assertRouteGuards(routeData, { early=false } = {}) {
   const out = Number(q?.outAmount || 0);
   const other = Number(q?.otherAmountThreshold || 0);
 
-  const minOther = (early && CFG.EARLY_RELAX_GUARDS_MS > 0)
-    ? Math.min(CFG.MIN_OTHER_OVER_OUT, CFG.EARLY_MIN_OTHER_OVER_OUT)
-    : CFG.MIN_OTHER_OVER_OUT;
-
+  const minOther = (early && CFG.EARLY_RELAX_GUARDS_MS > 0 && CFG.EARLY_MIN_OTHER_OVER_OUT < CFG.MIN_OTHER_OVER_OUT)
+     ? CFG.EARLY_MIN_OTHER_OVER_OUT
+     : CFG.MIN_OTHER_OVER_OUT;
+  
   if (impactPct > CFG.MAX_PRICE_IMPACT_PCT) throw new Error(`route-guard: priceImpact ${impactPct.toFixed(2)}% > ${CFG.MAX_PRICE_IMPACT_PCT}%`);
   if (out > 0) {
     const ratioOther = other / out;
@@ -563,7 +572,7 @@ class HeliusWS {
       }
       info(`[WS] logs ${CFG.WS_REQUIRE_PATTERN ? 'match' : 'seen'} → subscribe for confirmation sig=${sig}`);
       // souscrit en 'processed' pour gagner quelques centaines de ms
-      this.signatureSubscribe(sig, 'processed');
+      this.signatureSubscribe(sig, CFG.SIGNATURE_COMMITMENT || 'processed');
       return;
     }
   
@@ -651,9 +660,9 @@ app.listen(CFG.PORT, () => {
   const programs = sanitizedProgramIds(CFG.AMM_PROGRAM_IDS);
   if (programs.length === 0) {
     warn('AMM_PROGRAM_IDS vide → écoute Pump AMM uniquement par défaut.');
-    ws.logsSubscribeMentions('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 'processed');
+    ws.logsSubscribeMentions('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', CFG.SIGNATURE_COMMITMENT || 'processed');
   } else {
-    for (const id of programs) ws.logsSubscribeMentions(id, 'processed');
+    for (const id of programs) ws.logsSubscribeMentions(id, CFG.SIGNATURE_COMMITMENT || 'processed');
   }
   ws.start();
 });
