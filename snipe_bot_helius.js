@@ -309,26 +309,26 @@ async function gmgnCheckStatus({ hash, lastValidBlockHeight }) {
   return data.data;
 }
 function ratioOutOverIn(q) { const out = Number(q?.outAmount || 0); const inp = Number(q?.inAmount || 0); return (inp>0? out/inp : 0); }
-function assertRouteGuards(routeData, { early=false } = {}) {
+function assertRouteGuards(routeData) {
   const q = routeData.quote || {};
   const impactPct = Number(q?.priceImpactPct || 0) * 100;
   const out = Number(q?.outAmount || 0);
   const other = Number(q?.otherAmountThreshold || 0);
 
-  const minOther = (early && CFG.EARLY_RELAX_GUARDS_MS > 0 && CFG.EARLY_MIN_OTHER_OVER_OUT < CFG.MIN_OTHER_OVER_OUT)
-     ? CFG.EARLY_MIN_OTHER_OVER_OUT
-     : CFG.MIN_OTHER_OVER_OUT;
-  
-  if (impactPct > CFG.MAX_PRICE_IMPACT_PCT) throw new Error(`route-guard: priceImpact ${impactPct.toFixed(2)}% > ${CFG.MAX_PRICE_IMPACT_PCT}%`);
-  if (out > 0) {
-    const ratioOther = other / out;
-    if (ratioOther < minOther) throw new Error(`route-guard: other/out ${(ratioOther).toFixed(3)} < ${minOther}`);
+  if (impactPct > CFG.MAX_PRICE_IMPACT_PCT) {
+    throw new Error(`route-guard: priceImpact ${impactPct.toFixed(2)}% > ${CFG.MAX_PRICE_IMPACT_PCT}%`);
   }
-  if (CFG.MIN_OUT_PER_SOL > 0) {
-    const r = ratioOutOverIn(q);
-    if (r < CFG.MIN_OUT_PER_SOL) throw new Error(`route-guard: out/in ${r.toFixed(6)} < ${CFG.MIN_OUT_PER_SOL}`);
+
+  // min-out cohérent avec la slippage tolérée (1% de marge)
+  if (out > 0) {
+    const minRatio = Math.max(0, (1 - CFG.MAX_SLIPPAGE) - 0.01); // ex: 0.69 si slippage=0.30
+    const ratioOther = other / out;
+    if (ratioOther + 1e-6 < minRatio) {
+      throw new Error(`route-guard: other/out ${ratioOther.toFixed(3)} < ${minRatio.toFixed(3)} (slippage)`);
+    }
   }
 }
+
 
 /* ====================== BUY / SELL ====================== */
 async function buyViaGMGN(mint, { startTs=Date.now() } = {}) {
@@ -419,8 +419,11 @@ async function sellAllViaGMGN(mint) {
 /* ====================== RUG GUARD ====================== */
 async function rugGuardAfterBuy({ mint, entryRatio }) {
   if (CFG.RUG_GUARD_WINDOW_MS <= 0) return;
+
   const t0 = Date.now();
   const probeIn = Math.max(1, Math.floor(0.01 * LAMPORTS_PER_SOL));
+  let failStreak = 0;
+
   while (Date.now() - t0 < CFG.RUG_GUARD_WINDOW_MS) {
     try {
       const probe = await gmgnGetRoute({
@@ -428,17 +431,34 @@ async function rugGuardAfterBuy({ mint, entryRatio }) {
         fromAddress: WALLET_PK, slippagePct: CFG.MAX_SLIPPAGE,
         feeSol: CFG.PRIORITY_FEE_SOL, isAntiMev: CFG.ANTI_MEV,
       });
+      failStreak = 0; // reset succès
+
       const imp = Number(probe.quote?.priceImpactPct || 0) * 100;
       const ratio = ratioOutOverIn(probe.quote);
+
       if (entryRatio > 0) {
         const dropPct = (1 - (ratio / entryRatio)) * 100;
-        if (dropPct >= CFG.RUG_DROP_PCT) { warn(`[RUG] drop ${dropPct.toFixed(1)}% ≥ ${CFG.RUG_DROP_PCT}% → SELL NOW`); await sellAllViaGMGN(mint); return; }
+        if (dropPct >= CFG.RUG_DROP_PCT) {
+          warn(`[RUG] drop ${dropPct.toFixed(1)}% ≥ ${CFG.RUG_DROP_PCT}% → SELL NOW`);
+          await sellAllViaGMGN(mint); return;
+        }
       }
-      if (imp > Math.max(45, CFG.MAX_PRICE_IMPACT_PCT + 20)) { warn(`[RUG] impact ${imp.toFixed(1)}% → SELL NOW`); await sellAllViaGMGN(mint); return; }
-    } catch(e) { warn('[RUG] probe error:', e.message); }
+      if (imp > Math.max(45, CFG.MAX_PRICE_IMPACT_PCT + 20)) {
+        warn(`[RUG] impact ${imp.toFixed(1)}% → SELL NOW`);
+        await sellAllViaGMGN(mint); return;
+      }
+    } catch (e) {
+      failStreak++;
+      warn('[RUG] probe error:', e.message);
+      if (failStreak >= 3) { // 3 probes KO d'affilée ⇒ on sort
+        warn('[RUG] probes repeatedly failing → SELL NOW');
+        await sellAllViaGMGN(mint); return;
+      }
+    }
     await sleep(250);
   }
 }
+
 
 /* ====================== Handler (depuis tx confirmé/processed) ====================== */
 const seenMint = new Map(); // anti-refire 30s
