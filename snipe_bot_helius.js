@@ -1,12 +1,14 @@
 /**
- * snipe_bot_ws_raw_gmgn.js — v5 (Helius WS + early-probe)
+ * snipe_bot_ws_raw_gmgn.js — v6 (Helius WS + early-probe + anti-withdraw)
  * - WS Helius logsSubscribe(mentions) + signatureSubscribe → commitment=processed (plus tôt)
- * - getTransaction en 'processed' (fallback implicite via file si 429)
- * - "Early Route Probe" : si route invalide (little pool / out=0) → retry rapide pendant X ms
- * - Garde-fous GMGN + relâche optionnelle pendant la phase précoce
+ * - getTransaction en 'confirmed' avec fallback 'finalized'
+ * - "Early Route Probe" (little pool / out=0) → retry rapide pendant X ms
+ * - Garde-fous GMGN (+ relâche optionnelle fenêtre ultra-précoce)
  * - Rug-guard / timeout de sortie
  * - Webhook raw & enhanced conservés
  * - File HTTP RPS bas + backoff exponentiel (évite le bruit 429)
+ * - ✅ NEW: Pré-submit "liquidity stability check" (anti-withdraw instantané)
+ * - ✅ NEW: Abonnement WS temporaire aux comptes du pool + détection de withdraw/removeLiquidity/burn
  */
 
 import 'dotenv/config';
@@ -98,6 +100,16 @@ const CFG = {
   RPC_MAX_CONCURRENCY: Number(process.env.RPC_MAX_CONCURRENCY || 1),
   RPC_BACKOFF_MS: Number(process.env.RPC_BACKOFF_MS || 800),
   RPC_BACKOFF_MAX_MS: Number(process.env.RPC_BACKOFF_MAX_MS || 5000),
+
+  /* ====== NEW Anti-withdraw params ====== */
+  // Pré-soumission : observation de la stabilité des comptes token du pool
+  PRE_SUBMIT_STABILITY_MS: Number(process.env.PRE_SUBMIT_STABILITY_MS || 350),
+  PRE_SUBMIT_POLLS: Number(process.env.PRE_SUBMIT_POLLS || 3),
+  PRE_SUBMIT_DROP_PCT: Number(process.env.PRE_SUBMIT_DROP_PCT || 6),
+
+  // Post-buy : écoute active des comptes pool
+  POST_SUBSCRIBE_MONITOR_MS: Number(process.env.POST_SUBSCRIBE_MONITOR_MS || 15000),
+  POOL_TOKEN_MIN_BALANCE: Number(process.env.POOL_TOKEN_MIN_BALANCE || 10), // uiAmount min pour considérer un compte
 };
 
 /* ====================== Logger ====================== */
@@ -132,6 +144,10 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fmt = (n, d=6) => (typeof n === 'number' ? Number(n).toFixed(d) : n);
 const PK_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
+/* Globals (anti-withdraw mapping) */
+const poolAddrToMint = new Map();   // pool token account addr -> mint we bought
+const mintToPoolAddrs = new Map();  // mint -> [pool token account addrs]
+
 /* ====================== File HTTP ====================== */
 class HttpBucket {
   constructor({ rps, concurrency, backoffMs, backoffMax }) {
@@ -163,7 +179,7 @@ class HttpBucket {
             errOnce('429', `429 rate-limited, retry in ${task.backoff}ms`);
             await sleep(task.backoff);
             task.backoff = Math.min(task.backoff * 2, this.backoffMax);
-            this.queue.push(task); // requeue
+            this.queue.push(task);
           } else {
             dbg('[HTTP err]', m);
             task.resolve(null);
@@ -183,24 +199,22 @@ const httpBucket = new HttpBucket({
 });
 
 async function getTransactionOnce(sig, commitment = 'confirmed') {
- return await httpBucket.push(
-   () => connection.getTransaction(sig, { commitment, maxSupportedTransactionVersion: 0 }),
-   `getTx:${commitment}`,
- );
+  return await httpBucket.push(
+    () => connection.getTransaction(sig, { commitment, maxSupportedTransactionVersion: 0 }),
+    `getTx:${commitment}`,
+  );
 }
 
 async function getTransactionWithFallback(sig) {
- let tx = await getTransactionOnce(sig, 'confirmed');
- if (tx) return tx;
- // one short wait, then try finalized (validators sometimes lag indexing at confirmed)
- await sleep(250);
- return await getTransactionOnce(sig, 'finalized');
+  let tx = await getTransactionOnce(sig, 'confirmed');
+  if (tx) return tx;
+  await sleep(250);
+  return await getTransactionOnce(sig, 'finalized');
 }
 
 /* ====================== Helpers extraction ====================== */
 function tsFromTxMs(tx) {
   const t = tx?.blockTime;
-  // En 'processed' blockTime peut être null → on considère "tout de suite"
   return (t ? Number(t) * 1000 : Date.now());
 }
 function poolAgeFromTxMs(tx) { return Date.now() - tsFromTxMs(tx); }
@@ -274,22 +288,18 @@ async function gmgnGetRoute({ tokenIn, tokenOut, inLamports, fromAddress, slippa
 
     if (good && outAmt > 0) return data.data;
 
-    // mémorise le dernier message pour l’erreur finale
     lastErr = `GMGN route invalid: ${JSON.stringify(data)} {status:${status}}`;
 
-    // cas attendus en pré-ouverture → petit retry rapide avec jitter
     const msg = String(data?.msg || '').toLowerCase();
     if (msg.includes('little pool') || outAmt === 0) {
-      const jitter = Math.floor(Math.random() * 50); // 0-50ms pour désync
+      const jitter = Math.floor(Math.random() * 50);
       await sleep(baseInt + jitter);
       continue;
     }
-    // autre erreur → inutile d’insister
     break;
   }
   throw new Error(lastErr);
 }
-
 
 async function gmgnSubmitSignedTx(base64Signed, isAntiMev=false) {
   const body = { chain: 'sol', signedTx: base64Signed };
@@ -318,10 +328,8 @@ function assertRouteGuards(routeData) {
   if (impactPct > CFG.MAX_PRICE_IMPACT_PCT) {
     throw new Error(`route-guard: priceImpact ${impactPct.toFixed(2)}% > ${CFG.MAX_PRICE_IMPACT_PCT}%`);
   }
-
-  // min-out cohérent avec la slippage tolérée (1% de marge)
   if (out > 0) {
-    const minRatio = Math.max(0, (1 - CFG.MAX_SLIPPAGE) - 0.01); // ex: 0.69 si slippage=0.30
+    const minRatio = Math.max(0, (1 - CFG.MAX_SLIPPAGE) - 0.01);
     const ratioOther = other / out;
     if (ratioOther + 1e-6 < minRatio) {
       throw new Error(`route-guard: other/out ${ratioOther.toFixed(3)} < ${minRatio.toFixed(3)} (slippage)`);
@@ -329,6 +337,104 @@ function assertRouteGuards(routeData) {
   }
 }
 
+/* ====================== NEW: Anti-withdraw helpers ====================== */
+const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+
+async function isTokenAccount(pubkeyStr) {
+  try {
+    const info = await connection.getParsedAccountInfo(new PublicKey(pubkeyStr), 'confirmed');
+    const val = info.value;
+    if (!val) return false;
+    // Plusieurs formats possibles suivant RPC
+    if (val?.owner?.toBase58 && String(val.owner?.toBase58()) === TOKEN_PROGRAM_ID) return true;
+    if (val?.data?.program === 'spl-token') return true;
+    if (val?.data?.parsed?.type === 'account') return true;
+    return false;
+  } catch (e) {
+    dbg('isTokenAccount err', e.message);
+    return false;
+  }
+}
+
+async function getTokenUiAmount(pubkeyStr) {
+  try {
+    const info = await connection.getParsedAccountInfo(new PublicKey(pubkeyStr), 'confirmed');
+    const data = info.value?.data;
+    const parsed = data?.parsed;
+    if (parsed && parsed?.info && parsed.info.tokenAmount) {
+      return Number(parsed.info.tokenAmount.uiAmount || 0);
+    }
+    return 0;
+  } catch (e) {
+    dbg('getTokenUiAmount err', e.message);
+    return 0;
+  }
+}
+
+// Extrait depuis raw swapTransaction (base64) les comptes SPL Token plausibles du pool
+async function extractPoolTokenAccountsFromRawBase64(base64Raw) {
+  try {
+    const buf = Buffer.from(base64Raw, 'base64');
+    const tx = VersionedTransaction.deserialize(buf);
+    const keys = tx.message.accountKeys.map(k => k.toBase58());
+    const tokenAccounts = [];
+    for (const k of keys) {
+      if (!PK_RE.test(k)) continue;
+      const isTok = await isTokenAccount(k);
+      if (isTok) {
+        const amt = await getTokenUiAmount(k);
+        if (amt >= CFG.POOL_TOKEN_MIN_BALANCE) tokenAccounts.push({ addr: k, uiAmount: amt });
+      }
+    }
+    return tokenAccounts;
+  } catch (e) {
+    dbg('extractPoolTokenAccounts err', e.message);
+    return [];
+  }
+}
+
+// Fenêtre très courte de polling pour s'assurer qu'il n'y a pas un withdraw en cours
+async function preSubmitLiquidityStabilityCheck(rawBase64) {
+  const tokenAccounts = await extractPoolTokenAccountsFromRawBase64(rawBase64);
+  if (!tokenAccounts.length) {
+    dbg('[PRECHECK] no pool token accounts found — skipping stability check');
+    return true; // pas d’info exploitable → on laisse passer
+  }
+  const polls = Math.max(1, CFG.PRE_SUBMIT_POLLS);
+  const totalMs = Math.max(0, CFG.PRE_SUBMIT_STABILITY_MS);
+  const waitMs = (polls > 1) ? Math.floor(totalMs / (polls - 1)) : 0;
+
+  const snapshots = [];
+  for (let i = 0; i < polls; i++) {
+    const snap = {};
+    for (const t of tokenAccounts) {
+      snap[t.addr] = await getTokenUiAmount(t.addr);
+    }
+    snapshots.push(snap);
+    if (i < polls - 1 && waitMs > 0) await sleep(waitMs);
+  }
+
+  for (const addr of Object.keys(snapshots[0])) {
+    let maxV = -Infinity, minV = Infinity;
+    for (const s of snapshots) {
+      const v = Number(s[addr] || 0);
+      if (v > maxV) maxV = v;
+      if (v < minV) minV = v;
+    }
+    if (maxV <= 0) {
+      dbg(`[PRECHECK] ${addr} maxV<=0 -> abort`);
+      return false;
+    }
+    const dropPct = (1 - (minV / maxV)) * 100;
+    dbg(`[PRECHECK] ${addr} max=${maxV} min=${minV} dropPct=${dropPct.toFixed(3)}%`);
+    if (dropPct >= CFG.PRE_SUBMIT_DROP_PCT) {
+      warn(`[PRECHECK] liquidity drop ${dropPct.toFixed(2)}% >= ${CFG.PRE_SUBMIT_DROP_PCT}% → abort buy`);
+      return false;
+    }
+  }
+  dbg('[PRECHECK] liquidity stable');
+  return true;
+}
 
 /* ====================== BUY / SELL ====================== */
 async function buyViaGMGN(mint, { startTs=Date.now() } = {}) {
@@ -342,7 +448,25 @@ async function buyViaGMGN(mint, { startTs=Date.now() } = {}) {
   const early = (Date.now() - startTs) <= CFG.EARLY_RELAX_GUARDS_MS;
   assertRouteGuards(route, { early });
 
-  const unsigned = Buffer.from(route.raw_tx.swapTransaction, 'base64');
+  // ===== NEW: pré-submit stability check (blocant) =====
+  const rawBase64 = route.raw_tx?.swapTransaction;
+  const stable = await preSubmitLiquidityStabilityCheck(rawBase64);
+  if (!stable) throw new Error('pre-submit liquidity stability check failed');
+
+  // ===== NEW: abonner WS aux comptes token du pool pendant N ms =====
+  let poolAddrs = [];
+  try {
+    const poolTokenAccounts = await extractPoolTokenAccountsFromRawBase64(rawBase64);
+    poolAddrs = poolTokenAccounts.map(x => x.addr);
+    if (poolAddrs.length && globalThis.wsInstance?.subscribeAccounts) {
+      globalThis.wsInstance.subscribeAccounts(poolAddrs);
+      // map pour détection rapide des logs suspects → SELL
+      for (const a of poolAddrs) poolAddrToMint.set(a, mint);
+      mintToPoolAddrs.set(mint, poolAddrs.slice());
+    }
+  } catch (e) { dbg('subscribe pool accounts err', e.message); }
+
+  const unsigned = Buffer.from(rawBase64, 'base64');
   const tx = VersionedTransaction.deserialize(unsigned);
   tx.sign([wallet]);
   const signed = Buffer.from(tx.serialize()).toString('base64');
@@ -350,6 +474,17 @@ async function buyViaGMGN(mint, { startTs=Date.now() } = {}) {
   const submit = await gmgnSubmitSignedTx(signed, CFG.ANTI_MEV);
   info(`[BUY] …pending hash=${submit.hash} r=${fmt(ratioOutOverIn(route.quote),6)}`);
   csv({ event:'enter', side:'BUY', sol:CFG.TRADE_SIZE_SOL, token:mint, extra:`hash=${submit.hash}` });
+
+  // Nettoyage des subscriptions après la fenêtre d'écoute
+  if (poolAddrs.length) {
+    setTimeout(() => {
+      try {
+        if (globalThis.wsInstance?.unsubscribeAccount) {
+          for (const a of poolAddrs) globalThis.wsInstance.unsubscribeAccount(a);
+        }
+      } catch {}
+    }, CFG.POST_SUBSCRIBE_MONITOR_MS);
+  }
 
   (async () => {
     try {
@@ -369,11 +504,9 @@ async function buyViaGMGN(mint, { startTs=Date.now() } = {}) {
 
 async function getTokenBalanceLamports(owner, mint) {
   const ownerPk = new PublicKey(owner); const mintPk  = new PublicKey(mint);
-  //const resp = await connection.getTokenAccountsByOwner(ownerPk, { mint: mintPk });
   const resp = await connection.getTokenAccountsByOwner(ownerPk, { mint: mintPk }, 'confirmed');
   let total = 0n;
   for (const it of resp.value) {
-    //const acc = await connection.getParsedAccountInfo(it.pubkey);
     const acc = await connection.getParsedAccountInfo(it.pubkey, 'confirmed');
     const amt = BigInt(acc.value?.data?.parsed?.info?.tokenAmount?.amount || '0');
     total += amt;
@@ -431,7 +564,7 @@ async function rugGuardAfterBuy({ mint, entryRatio }) {
         fromAddress: WALLET_PK, slippagePct: CFG.MAX_SLIPPAGE,
         feeSol: CFG.PRIORITY_FEE_SOL, isAntiMev: CFG.ANTI_MEV,
       });
-      failStreak = 0; // reset succès
+      failStreak = 0;
 
       const imp = Number(probe.quote?.priceImpactPct || 0) * 100;
       const ratio = ratioOutOverIn(probe.quote);
@@ -450,15 +583,14 @@ async function rugGuardAfterBuy({ mint, entryRatio }) {
     } catch (e) {
       failStreak++;
       warn('[RUG] probe error:', e.message);
-      if (failStreak >= 3) { // 3 probes KO d'affilée ⇒ on sort
+      if (failStreak >= 3) {
         warn('[RUG] probes repeatedly failing → SELL NOW');
         await sellAllViaGMGN(mint); return;
       }
     }
-    await sleep(250);
+    await sleep(220); // plus agressif qu'avant
   }
 }
-
 
 /* ====================== Handler (depuis tx confirmé/processed) ====================== */
 const seenMint = new Map(); // anti-refire 30s
@@ -513,9 +645,9 @@ class HeliusWS {
     this.pinger = null;
     this.reconnTimer = null;
     this.nextId = 1;
-    this.reqIdToSig = new Map();     // id de requête -> signature (avant que Helius renvoie le subId)
-    this.subIdToSig = new Map();     // id d’abonnement -> signature (pour les notifications)
 
+    this.reqIdToSig = new Map(); // request id -> signature (avant subId)
+    this.subIdToSig = new Map(); // subId -> signature (pour notifications)
   }
   start() { this._connect(); }
   stop() { try { this.ws?.close(); } catch{} clearInterval(this.pinger); clearTimeout(this.reconnTimer); }
@@ -552,24 +684,37 @@ class HeliusWS {
 
   signatureSubscribe(sig, commitment = 'processed') {
     const id = this.nextId++;
-    const payload = {
-      jsonrpc: '2.0',
-      id,
-      method: 'signatureSubscribe',
-      params: [sig, { commitment }],
-    };
-    // on mémorise la sig avec l'id de requête; Helius nous renverra ensuite un subId
+    const payload = { jsonrpc: '2.0', id, method: 'signatureSubscribe', params: [sig, { commitment }] };
     this.reqIdToSig.set(id, sig);
     this._send(payload);
   }
-  
+
+  // ===== NEW: subscribe/unsubscribe dynamiques sur comptes pools =====
+  subscribeAccounts(accounts) {
+    for (const a of accounts) {
+      try {
+        if (!PK_RE.test(a)) continue;
+        const key = `logs:${a}`;
+        if (this.subs.has(key)) continue;
+        const id = this.nextId++;
+        const payload = { jsonrpc: '2.0', id, method: 'logsSubscribe', params: [{ mentions: [a] }, { commitment: 'processed' }] };
+        this.subs.set(key, payload);
+        this._send(payload);
+        info(`WS pool-account listener started: ${a}`);
+      } catch (e) { dbg('subscribeAccounts err', e.message); }
+    }
+  }
+  unsubscribeAccount(a) {
+    const key = `logs:${a}`;
+    if (this.subs.has(key)) this.subs.delete(key);
+  }
+
   async _onMessage(data) {
     let msg = null;
     try { msg = JSON.parse(String(data)); } catch { return; }
-  
-    // 1) Réponse d'abonnement (nous donne le subId)
+
+    // Abonnement à signature → nous renvoie un subId
     if (msg?.id && msg?.result && typeof msg.result === 'number') {
-      // Est-ce la réponse à un signatureSubscribe ?
       const sig = this.reqIdToSig.get(msg.id);
       if (sig) {
         const subId = msg.result;
@@ -578,43 +723,55 @@ class HeliusWS {
         return;
       }
     }
-  
-    // 2) logsNotification -> on filtre puis on souscrit à la signature
+
+    // logsNotification
     if (msg?.method === 'logsNotification') {
       const res = msg?.params?.result?.value;
       const sig = res?.signature;
       const logs = res?.logs || [];
       if (!sig || !Array.isArray(logs) || logs.length === 0) return;
-  
+
+      // 1) Déclencheur initial (création pool etc.)
       if (CFG.WS_REQUIRE_PATTERN) {
         const hit = logs.some(line => LOG_RE.test(line));
-        if (!hit) { dbg('[WS] skip logs (no pattern match) sig=', sig); return; }
+        if (hit) {
+          info(`[WS] logs match → signatureSubscribe (sig=${sig})`);
+          this.signatureSubscribe(sig, CFG.SIGNATURE_COMMITMENT || 'processed');
+        }
+      } else {
+        this.signatureSubscribe(sig, CFG.SIGNATURE_COMMITMENT || 'processed');
       }
-      info(`[WS] logs ${CFG.WS_REQUIRE_PATTERN ? 'match' : 'seen'} → subscribe for confirmation sig=${sig}`);
-      // souscrit en 'processed' pour gagner quelques centaines de ms
-      this.signatureSubscribe(sig, CFG.SIGNATURE_COMMITMENT || 'processed');
+
+      // 2) ===== NEW: détection "withdraw/remove liquidity/burn" sur comptes surveillés =====
+      const joined = logs.join(' ').toLowerCase();
+      const suspiciousKw = ['withdraw', 'remove_liquidity', 'removeliquidity', 'withdrawliquidity', 'closeposition', 'decrease_liquidity', 'burn', 'burned', 'rmlq', 'withdraw_reserve'];
+      const hitKw = suspiciousKw.some(k => joined.includes(k));
+
+      if (hitKw) {
+        for (const [addr, mint] of poolAddrToMint.entries()) {
+          if (joined.includes(addr.toLowerCase())) {
+            warn(`[WS] ⚠️ detected withdraw-like log on ${addr} (sig=${sig}) → SELL ALL for mint ${mint}`);
+            (async () => { try { await sellAllViaGMGN(mint); } catch(e) { warn('post-withdraw sell err', e.message); } })();
+          }
+        }
+      }
       return;
     }
-  
-    // 3) signatureNotification -> on récupère la sig via le subId puis on traite
+
+    // signatureNotification
     if (msg?.method === 'signatureNotification') {
       const subId = msg?.params?.subscription;
       const sig = this.subIdToSig.get(subId);
       const errV = msg?.params?.result?.value?.err ?? msg?.params?.result?.err ?? null;
-  
+
       if (!sig) { dbg('[WS] signatureNotification sans sig (subId inconnu)'); return; }
-  
-      // on peut se désabonner si tu veux (optionnel)
-      // this._send({ jsonrpc:'2.0', id:this.nextId++, method:'signatureUnsubscribe', params:[subId] });
+
       this.subIdToSig.delete(subId);
-  
+
       if (errV) { dbg(`[WS] signature FAILED sig=${sig}`); return; }
-  
-      // récupère la TX le plus tôt possible
-      //const tx = await getTransactionOnce(sig, 'processed'); // plus tôt
+
       const tx = await getTransactionWithFallback(sig);
       if (!tx) { dbg(`[WS] getTransaction miss (confirmed) sig=${sig}`); return; }
-  
       await handleFromTx(sig, tx);
       return;
     }
@@ -627,11 +784,9 @@ app.use(bodyParser.json({ limit: '20mb' }));
 
 app.post('/helius-webhook', async (req, res) => {
   try {
-    // RAW: {signature:"..."} ou body string
     if (req.body && (req.body.signature || req.body.txSig || typeof req.body === 'string')) {
       const sig = req.body.signature || req.body.txSig || (typeof req.body === 'string' ? req.body : null);
       info('RAW webhook sig:', sig);
-      //const tx = await getTransactionOnce(sig, CFG.TX_FETCH_COMMITMENT);
       const tx = await getTransactionWithFallback(sig);
       if (!tx) return res.status(200).send({ ok:true, note:'tx-not-found', sig });
       await handleFromTx(sig, tx);
@@ -640,7 +795,6 @@ app.post('/helius-webhook', async (req, res) => {
     const payload = Array.isArray(req.body) ? req.body[0] : req.body;
     const sig = payload?.signature || payload?.transaction?.signatures?.[0];
     if (!sig) return res.status(200).send({ ok:true, note:'no-signature' });
-    //const tx = await getTransactionOnce(sig, CFG.TX_FETCH_COMMITMENT);
     const tx = await getTransactionWithFallback(sig);
     if (!tx) return res.status(200).send({ ok:true, note:'tx-not-found', sig });
     await handleFromTx(sig, tx);
@@ -669,6 +823,14 @@ app.get('/health', (_req, res) => res.send({
     patterns: CFG.POOL_LOG_PATTERNS,
     commitments: { sig: CFG.SIGNATURE_COMMITMENT, tx: CFG.TX_FETCH_COMMITMENT },
     earlyProbe: { ms: CFG.EARLY_ROUTE_PROBE_MS, interval: CFG.EARLY_ROUTE_PROBE_INTERVAL_MS, relaxMs: CFG.EARLY_RELAX_GUARDS_MS },
+    // NEW:
+    antiWithdraw: {
+      preMs: CFG.PRE_SUBMIT_STABILITY_MS,
+      prePolls: CFG.PRE_SUBMIT_POLLS,
+      preDropPct: CFG.PRE_SUBMIT_DROP_PCT,
+      postListenMs: CFG.POST_SUBSCRIBE_MONITOR_MS,
+      poolTokMin: CFG.POOL_TOKEN_MIN_BALANCE,
+    },
   },
 }));
 
@@ -677,6 +839,8 @@ app.listen(CFG.PORT, () => {
   info(`GMGN sniping listener on :${CFG.PORT} (LOG_LEVEL=${CFG.LOG_LEVEL})`);
 
   const ws = new HeliusWS(CFG.HELIUS_WS_URL);
+  globalThis.wsInstance = ws; // <— exposé pour buyViaGMGN (subscriptions dynamiques)
+
   const programs = sanitizedProgramIds(CFG.AMM_PROGRAM_IDS);
   if (programs.length === 0) {
     warn('AMM_PROGRAM_IDS vide → écoute Pump AMM uniquement par défaut.');
