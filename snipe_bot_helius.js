@@ -1,14 +1,15 @@
 /**
- * snipe_bot_ws_raw_gmgn.js — v6 (Helius WS + early-probe + anti-withdraw)
- * - WS Helius logsSubscribe(mentions) + signatureSubscribe → commitment=processed (plus tôt)
- * - getTransaction en 'confirmed' avec fallback 'finalized'
- * - "Early Route Probe" (little pool / out=0) → retry rapide pendant X ms
- * - Garde-fous GMGN (+ relâche optionnelle fenêtre ultra-précoce)
- * - Rug-guard / timeout de sortie
- * - Webhook raw & enhanced conservés
- * - File HTTP RPS bas + backoff exponentiel (évite le bruit 429)
- * - ✅ NEW: Pré-submit "liquidity stability check" (anti-withdraw instantané)
- * - ✅ NEW: Abonnement WS temporaire aux comptes du pool + détection de withdraw/removeLiquidity/burn
+ * snipe_bot_ws_raw_gmgn.js — v7 (anti-withdraw + holders + sell-probe)
+ *
+ * - WS Helius logsSubscribe(mentions) + signatureSubscribe + accountSubscribe (réserves pool)
+ * - getTransaction 'confirmed' + fallback 'finalized'
+ * - Early Route Probe (little pool / out=0) → retry X ms
+ * - Garde-fous GMGN (slippage/min-out/price impact)
+ * - Pré-submit: "liquidity stability check" (anti-withdraw instantané)
+ * - Post-buy: écoute logs + accounts (drop réserves) → SELL agressif
+ * - Post-buy: sondage SELL (route dispo + ratio) toutes 200ms
+ * - Holders guard: top1/top10 hors réserves (pré-buy + re-check 2s) → exit si concentré
+ * - Timeout de sortie + rug-guard prix
  */
 
 import 'dotenv/config';
@@ -30,13 +31,13 @@ import {
 const CFG = {
   PORT: Number(process.env.PORT || 10000),
 
-  // RPC HTTP — utilisé uniquement après notif WS
+  // RPC HTTP
   RPC_URL: process.env.RPC_URL || 'https://api.mainnet-beta.solana.com',
 
   // WebSocket Helius
   HELIUS_WS_URL: process.env.HELIUS_WS_URL || '',
 
-  // Commitments (plus tôt = 'processed')
+  // Commitments
   SIGNATURE_COMMITMENT: (process.env.SIGNATURE_COMMITMENT || 'processed'),
   TX_FETCH_COMMITMENT: (process.env.TX_FETCH_COMMITMENT || 'confirmed'),
 
@@ -47,8 +48,11 @@ const CFG = {
 
   // Trade
   TRADE_SIZE_SOL: Number(process.env.TRADE_SIZE_SOL || 0.20),
-  MAX_SLIPPAGE: Number(process.env.MAX_SLIPPAGE || 0.30), // en %
-  PRIORITY_FEE_SOL: Number(process.env.PRIORITY_FEE_SOL || 0.006),
+  MAX_SLIPPAGE: Number(process.env.MAX_SLIPPAGE || 0.30), // 0.20 = 20%
+  // priority fees (BUY/SELL distincts possibles)
+  PRIORITY_FEE_SOL: Number(process.env.PRIORITY_FEE_SOL || 0.006), // fallback
+  PRIORITY_FEE_BUY: (process.env.PRIORITY_FEE_BUY !== undefined ? Number(process.env.PRIORITY_FEE_BUY) : undefined),
+  PRIORITY_FEE_SELL: (process.env.PRIORITY_FEE_SELL !== undefined ? Number(process.env.PRIORITY_FEE_SELL) : undefined),
   ANTI_MEV: ['1','true','yes'].includes(String(process.env.ANTI_MEV || '').toLowerCase()),
 
   // Sortie
@@ -59,15 +63,15 @@ const CFG = {
   MIN_OTHER_OVER_OUT: Number(process.env.MIN_OTHER_OVER_OUT || 0.965),
   MIN_OUT_PER_SOL: Number(process.env.MIN_OUT_PER_SOL || 0),
 
-  // Relâche (optionnelle) des gardes pendant la fenêtre ultra-précoce
+  // Relâche précoce (optionnelle)
   EARLY_RELAX_GUARDS_MS: Number(process.env.EARLY_RELAX_GUARDS_MS || 2000),
   EARLY_MIN_OTHER_OVER_OUT: Number(process.env.EARLY_MIN_OTHER_OVER_OUT || 0.72),
 
-  // Early probe de route (pour éviter “little pool hit”)
+  // Early route probe
   EARLY_ROUTE_PROBE_MS: Number(process.env.EARLY_ROUTE_PROBE_MS || 3000),
   EARLY_ROUTE_PROBE_INTERVAL_MS: Number(process.env.EARLY_ROUTE_PROBE_INTERVAL_MS || 120),
 
-  // Rug-guard post-entrée
+  // Rug-guard prix
   RUG_GUARD_WINDOW_MS: Number(process.env.RUG_GUARD_WINDOW_MS || 2000),
   RUG_DROP_PCT: Number(process.env.RUG_DROP_PCT || 30),
 
@@ -82,7 +86,7 @@ const CFG = {
   CSV_FILE: process.env.CSV_FILE || 'live_trades.csv',
   LOG_LEVEL: (process.env.LOG_LEVEL || 'info').toLowerCase(),
 
-  // AMM programs (CSV). Vide → défaut Pump AMM seulement
+  // AMM programs
   AMM_PROGRAM_IDS: (process.env.AMM_PROGRAM_IDS || '')
     .split(',').map(s => s.trim()).filter(Boolean),
 
@@ -101,15 +105,21 @@ const CFG = {
   RPC_BACKOFF_MS: Number(process.env.RPC_BACKOFF_MS || 800),
   RPC_BACKOFF_MAX_MS: Number(process.env.RPC_BACKOFF_MAX_MS || 5000),
 
-  /* ====== NEW Anti-withdraw params ====== */
-  // Pré-soumission : observation de la stabilité des comptes token du pool
+  /* ====== Anti-withdraw params ====== */
   PRE_SUBMIT_STABILITY_MS: Number(process.env.PRE_SUBMIT_STABILITY_MS || 350),
   PRE_SUBMIT_POLLS: Number(process.env.PRE_SUBMIT_POLLS || 3),
   PRE_SUBMIT_DROP_PCT: Number(process.env.PRE_SUBMIT_DROP_PCT || 6),
-
-  // Post-buy : écoute active des comptes pool
   POST_SUBSCRIBE_MONITOR_MS: Number(process.env.POST_SUBSCRIBE_MONITOR_MS || 15000),
-  POOL_TOKEN_MIN_BALANCE: Number(process.env.POOL_TOKEN_MIN_BALANCE || 10), // uiAmount min pour considérer un compte
+  POOL_TOKEN_MIN_BALANCE: Number(process.env.POOL_TOKEN_MIN_BALANCE || 10),
+
+  /* ====== Account drop trigger ====== */
+  ACCT_DROP_PCT_TRIGGER: Number(process.env.ACCT_DROP_PCT_TRIGGER || 15), // % de chute d'une réserve ⇒ SELL
+
+  /* ====== Holders concentration ====== */
+  TOP1_HOLDER_MAX_PCT: Number(process.env.TOP1_HOLDER_MAX_PCT || 40),
+  TOP10_HOLDER_MAX_PCT: Number(process.env.TOP10_HOLDER_MAX_PCT || 85),
+  HOLDER_CHECK_PREBUY: ['1','true','yes'].includes(String(process.env.HOLDER_CHECK_PREBUY || 'true').toLowerCase()),
+  HOLDER_CHECK_POSTBUY_MS: Number(process.env.HOLDER_CHECK_POSTBUY_MS || 2000),
 };
 
 /* ====================== Logger ====================== */
@@ -144,7 +154,7 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fmt = (n, d=6) => (typeof n === 'number' ? Number(n).toFixed(d) : n);
 const PK_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
-/* Globals (anti-withdraw mapping) */
+/* Globals */
 const poolAddrToMint = new Map();   // pool token account addr -> mint we bought
 const mintToPoolAddrs = new Map();  // mint -> [pool token account addrs]
 
@@ -204,7 +214,6 @@ async function getTransactionOnce(sig, commitment = 'confirmed') {
     `getTx:${commitment}`,
   );
 }
-
 async function getTransactionWithFallback(sig) {
   let tx = await getTransactionOnce(sig, 'confirmed');
   if (tx) return tx;
@@ -263,7 +272,6 @@ async function gmgnGetRouteRaw(params) {
     return { ok: res.ok, data, status: res.status };
   }, 'gmgn:get_route');
 }
-
 async function gmgnGetRoute({ tokenIn, tokenOut, inLamports, fromAddress, slippagePct, feeSol, isAntiMev=false }) {
   const params = new URLSearchParams({
     token_in_address: tokenIn,
@@ -300,7 +308,6 @@ async function gmgnGetRoute({ tokenIn, tokenOut, inLamports, fromAddress, slippa
   }
   throw new Error(lastErr);
 }
-
 async function gmgnSubmitSignedTx(base64Signed, isAntiMev=false) {
   const body = { chain: 'sol', signedTx: base64Signed };
   if (isAntiMev) body.isAntiMev = true;
@@ -345,33 +352,23 @@ async function isTokenAccount(pubkeyStr) {
     const info = await connection.getParsedAccountInfo(new PublicKey(pubkeyStr), 'confirmed');
     const val = info.value;
     if (!val) return false;
-    // Plusieurs formats possibles suivant RPC
     if (val?.owner?.toBase58 && String(val.owner?.toBase58()) === TOKEN_PROGRAM_ID) return true;
     if (val?.data?.program === 'spl-token') return true;
     if (val?.data?.parsed?.type === 'account') return true;
     return false;
-  } catch (e) {
-    dbg('isTokenAccount err', e.message);
-    return false;
-  }
+  } catch { return false; }
 }
-
 async function getTokenUiAmount(pubkeyStr) {
   try {
     const info = await connection.getParsedAccountInfo(new PublicKey(pubkeyStr), 'confirmed');
     const data = info.value?.data;
     const parsed = data?.parsed;
-    if (parsed && parsed?.info && parsed.info.tokenAmount) {
+    if (parsed?.info?.tokenAmount) {
       return Number(parsed.info.tokenAmount.uiAmount || 0);
     }
     return 0;
-  } catch (e) {
-    dbg('getTokenUiAmount err', e.message);
-    return 0;
-  }
+  } catch { return 0; }
 }
-
-// Extrait depuis raw swapTransaction (base64) les comptes SPL Token plausibles du pool
 async function extractPoolTokenAccountsFromRawBase64(base64Raw) {
   try {
     const buf = Buffer.from(base64Raw, 'base64');
@@ -387,85 +384,126 @@ async function extractPoolTokenAccountsFromRawBase64(base64Raw) {
       }
     }
     return tokenAccounts;
-  } catch (e) {
-    dbg('extractPoolTokenAccounts err', e.message);
-    return [];
-  }
+  } catch { return []; }
 }
-
-// Fenêtre très courte de polling pour s'assurer qu'il n'y a pas un withdraw en cours
 async function preSubmitLiquidityStabilityCheck(rawBase64) {
   const tokenAccounts = await extractPoolTokenAccountsFromRawBase64(rawBase64);
   if (!tokenAccounts.length) {
-    dbg('[PRECHECK] no pool token accounts found — skipping stability check');
-    return true; // pas d’info exploitable → on laisse passer
+    dbg('[PRECHECK] no pool token accounts found — skipping');
+    return true;
   }
   const polls = Math.max(1, CFG.PRE_SUBMIT_POLLS);
   const totalMs = Math.max(0, CFG.PRE_SUBMIT_STABILITY_MS);
   const waitMs = (polls > 1) ? Math.floor(totalMs / (polls - 1)) : 0;
 
-  const snapshots = [];
+  const snaps = [];
   for (let i = 0; i < polls; i++) {
     const snap = {};
-    for (const t of tokenAccounts) {
-      snap[t.addr] = await getTokenUiAmount(t.addr);
-    }
-    snapshots.push(snap);
+    for (const t of tokenAccounts) snap[t.addr] = await getTokenUiAmount(t.addr);
+    snaps.push(snap);
     if (i < polls - 1 && waitMs > 0) await sleep(waitMs);
   }
 
-  for (const addr of Object.keys(snapshots[0])) {
+  for (const addr of Object.keys(snaps[0])) {
     let maxV = -Infinity, minV = Infinity;
-    for (const s of snapshots) {
+    for (const s of snaps) {
       const v = Number(s[addr] || 0);
       if (v > maxV) maxV = v;
       if (v < minV) minV = v;
     }
-    if (maxV <= 0) {
-      dbg(`[PRECHECK] ${addr} maxV<=0 -> abort`);
-      return false;
-    }
+    if (maxV <= 0) return false;
     const dropPct = (1 - (minV / maxV)) * 100;
-    dbg(`[PRECHECK] ${addr} max=${maxV} min=${minV} dropPct=${dropPct.toFixed(3)}%`);
+    dbg(`[PRECHECK] ${addr} drop=${dropPct.toFixed(2)}%`);
     if (dropPct >= CFG.PRE_SUBMIT_DROP_PCT) {
-      warn(`[PRECHECK] liquidity drop ${dropPct.toFixed(2)}% >= ${CFG.PRE_SUBMIT_DROP_PCT}% → abort buy`);
+      warn(`[PRECHECK] liquidity drop ${dropPct.toFixed(2)}% ≥ ${CFG.PRE_SUBMIT_DROP_PCT}% → abort buy`);
       return false;
     }
   }
-  dbg('[PRECHECK] liquidity stable');
   return true;
 }
 
+/* ====================== Holders concentration ====================== */
+async function getLargestHoldersMetrics(mint, { excludeAddrs = [] } = {}) {
+  try {
+    const mintPk = new PublicKey(mint);
+    const [largest, supplyInfo] = await Promise.all([
+      connection.getTokenLargestAccounts(mintPk, 'confirmed'),
+      connection.getTokenSupply(mintPk, 'confirmed'),
+    ]);
+    const supply = Number(supplyInfo?.value?.uiAmount || 0);
+    const list = largest?.value || [];
+    if (!supply || !list.length) {
+      return { ok:false, reason:'no-supply-or-largest', supply:0, top1Pct:0, top10Pct:0 };
+    }
+    const ex = new Set(excludeAddrs);
+    const top = [];
+    for (const it of list) {
+      const addr = it?.address?.toBase58 ? it.address.toBase58() : String(it.address || '');
+      const amt  = Number(it?.uiAmount || 0);
+      if (!addr || !Number.isFinite(amt)) continue;
+      if (ex.has(addr)) continue;
+      top.push({ addr, amt });
+    }
+    top.sort((a,b)=> b.amt - a.amt);
+    const top1 = top[0]?.amt || 0;
+    const top10 = top.slice(0,10).reduce((s,x)=> s + x.amt, 0);
+    const top1Pct  = supply>0 ? (top1 / supply) * 100 : 0;
+    const top10Pct = supply>0 ? (top10 / supply) * 100 : 0;
+    return { ok:true, supply, top1Pct, top10Pct, top, excluded: excludeAddrs };
+  } catch (e) {
+    warn('holders metrics error:', e.message);
+    return { ok:false, reason:e.message, supply:0, top1Pct:0, top10Pct:0 };
+  }
+}
+
 /* ====================== BUY / SELL ====================== */
+function feeBuy()  { return (CFG.PRIORITY_FEE_BUY ?? CFG.PRIORITY_FEE_SOL); }
+function feeSell() { return (CFG.PRIORITY_FEE_SELL ?? CFG.PRIORITY_FEE_SOL); }
+
 async function buyViaGMGN(mint, { startTs=Date.now() } = {}) {
   const inLamports = Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL);
   const route = await gmgnGetRoute({
     tokenIn: CFG.BASE_SOL_MINT, tokenOut: mint, inLamports,
     fromAddress: WALLET_PK, slippagePct: CFG.MAX_SLIPPAGE,
-    feeSol: CFG.PRIORITY_FEE_SOL, isAntiMev: CFG.ANTI_MEV,
+    feeSol: feeBuy(), isAntiMev: CFG.ANTI_MEV,
   });
 
   const early = (Date.now() - startTs) <= CFG.EARLY_RELAX_GUARDS_MS;
   assertRouteGuards(route, { early });
 
-  // ===== NEW: pré-submit stability check (blocant) =====
   const rawBase64 = route.raw_tx?.swapTransaction;
+
+  // Pré-submit stability
   const stable = await preSubmitLiquidityStabilityCheck(rawBase64);
   if (!stable) throw new Error('pre-submit liquidity stability check failed');
 
-  // ===== NEW: abonner WS aux comptes token du pool pendant N ms =====
+  // Identifie comptes du pool + subscribe (logs + accounts)
   let poolAddrs = [];
   try {
-    const poolTokenAccounts = await extractPoolTokenAccountsFromRawBase64(rawBase64);
-    poolAddrs = poolTokenAccounts.map(x => x.addr);
-    if (poolAddrs.length && globalThis.wsInstance?.subscribeAccounts) {
-      globalThis.wsInstance.subscribeAccounts(poolAddrs);
-      // map pour détection rapide des logs suspects → SELL
-      for (const a of poolAddrs) poolAddrToMint.set(a, mint);
+    const poolTok = await extractPoolTokenAccountsFromRawBase64(rawBase64);
+    poolAddrs = poolTok.map(x => x.addr);
+    if (poolAddrs.length && globalThis.wsInstance) {
+      globalThis.wsInstance.subscribeAccounts(poolAddrs);      // logs
+      for (const a of poolAddrs) {
+        poolAddrToMint.set(a, mint);
+        globalThis.wsInstance.accountSubscribe(a);            // accounts (balances)
+      }
       mintToPoolAddrs.set(mint, poolAddrs.slice());
     }
   } catch (e) { dbg('subscribe pool accounts err', e.message); }
 
+  // (Optionnel recommandé) Holders guard AVANT BUY
+  if (CFG.HOLDER_CHECK_PREBUY) {
+    const holders = await getLargestHoldersMetrics(mint, { excludeAddrs: poolAddrs });
+    if (holders.ok) {
+      info(`[HOLDERS pre] top1=${holders.top1Pct.toFixed(1)}% | top10=${holders.top10Pct.toFixed(1)}%`);
+      if (holders.top1Pct >= CFG.TOP1_HOLDER_MAX_PCT || holders.top10Pct >= CFG.TOP10_HOLDER_MAX_PCT) {
+        throw new Error(`holders-guard: concentration too high (top1=${holders.top1Pct.toFixed(1)}% / top10=${holders.top10Pct.toFixed(1)}%)`);
+      }
+    }
+  }
+
+  // Sign & submit
   const unsigned = Buffer.from(rawBase64, 'base64');
   const tx = VersionedTransaction.deserialize(unsigned);
   tx.sign([wallet]);
@@ -475,7 +513,7 @@ async function buyViaGMGN(mint, { startTs=Date.now() } = {}) {
   info(`[BUY] …pending hash=${submit.hash} r=${fmt(ratioOutOverIn(route.quote),6)}`);
   csv({ event:'enter', side:'BUY', sol:CFG.TRADE_SIZE_SOL, token:mint, extra:`hash=${submit.hash}` });
 
-  // Nettoyage des subscriptions après la fenêtre d'écoute
+  // Nettoyage subscriptions après fenêtre d’écoute
   if (poolAddrs.length) {
     setTimeout(() => {
       try {
@@ -486,6 +524,7 @@ async function buyViaGMGN(mint, { startTs=Date.now() } = {}) {
     }, CFG.POST_SUBSCRIBE_MONITOR_MS);
   }
 
+  // Status log
   (async () => {
     try {
       const maxMs = 8000, t0 = Date.now();
@@ -498,6 +537,27 @@ async function buyViaGMGN(mint, { startTs=Date.now() } = {}) {
       warn('BUY status timeout');
     } catch(e) { warn('status error:', e.message); }
   })();
+
+  const entryRatio = ratioOutOverIn(route.quote) || 0;
+
+  // Probe SELL agressif pendant quelques secondes
+  postBuySellProbe(mint, entryRatio).catch(()=>{});
+
+  // Re-check holders après X ms → SELL si concentré
+  if (CFG.HOLDER_CHECK_POSTBUY_MS > 0) {
+    setTimeout(async () => {
+      try {
+        const holders = await getLargestHoldersMetrics(mint, { excludeAddrs: poolAddrs });
+        if (holders.ok) {
+          info(`[HOLDERS post] top1=${holders.top1Pct.toFixed(1)}% | top10=${holders.top10Pct.toFixed(1)}%`);
+          if (holders.top1Pct >= CFG.TOP1_HOLDER_MAX_PCT || holders.top10Pct >= CFG.TOP10_HOLDER_MAX_PCT) {
+            warn('[HOLDERS post] concentration too high → SELL NOW');
+            await sellAllViaGMGN(mint);
+          }
+        }
+      } catch (e) { warn('holders post-check error:', e.message); }
+    }, CFG.HOLDER_CHECK_POSTBUY_MS);
+  }
 
   return { route, hash: submit.hash };
 }
@@ -513,7 +573,6 @@ async function getTokenBalanceLamports(owner, mint) {
   }
   return Number(total);
 }
-
 async function sellAllViaGMGN(mint) {
   const amountIn = await getTokenBalanceLamports(WALLET_PK, mint);
   if (amountIn <= 0) { warn('[SELL] skip: no token balance'); return null; }
@@ -521,7 +580,7 @@ async function sellAllViaGMGN(mint) {
   const route = await gmgnGetRoute({
     tokenIn: mint, tokenOut: CFG.BASE_SOL_MINT, inLamports: amountIn,
     fromAddress: WALLET_PK, slippagePct: CFG.MAX_SLIPPAGE,
-    feeSol: CFG.PRIORITY_FEE_SOL, isAntiMev: CFG.ANTI_MEV,
+    feeSol: feeSell(), isAntiMev: CFG.ANTI_MEV,
   });
 
   const unsigned = Buffer.from(route.raw_tx.swapTransaction, 'base64');
@@ -549,7 +608,36 @@ async function sellAllViaGMGN(mint) {
   return { route, hash: submit.hash };
 }
 
-/* ====================== RUG GUARD ====================== */
+/* ===== Post-buy SELL probe: toutes 200ms pendant 8s ===== */
+async function postBuySellProbe(mint, entryRatio) {
+  const t0 = Date.now(), maxMs = 8000;
+  while (Date.now() - t0 < maxMs) {
+    try {
+      const bal = await getTokenBalanceLamports(WALLET_PK, mint);
+      if (bal <= 0) return;
+      const route = await gmgnGetRoute({
+        tokenIn: mint, tokenOut: CFG.BASE_SOL_MINT, inLamports: bal,
+        fromAddress: WALLET_PK, slippagePct: CFG.MAX_SLIPPAGE,
+        feeSol: feeSell(), isAntiMev: CFG.ANTI_MEV,
+      });
+      const r = ratioOutOverIn(route.quote);
+      if (entryRatio > 0 && r < entryRatio * 0.85) {
+        warn(`[PROBE] sell ratio collapsing (${r.toFixed(4)} < ${(entryRatio*0.85).toFixed(4)}) → SELL NOW`);
+        await sellAllViaGMGN(mint); return;
+      }
+    } catch (e) {
+      const m = String(e.message||'').toLowerCase();
+      if (m.includes('no route')) {
+        warn('[PROBE] jupiter has no route (SELL) → try immediate sell now');
+        try { await sellAllViaGMGN(mint); } catch {}
+        return;
+      }
+    }
+    await sleep(200);
+  }
+}
+
+/* ====================== RUG GUARD prix ====================== */
 async function rugGuardAfterBuy({ mint, entryRatio }) {
   if (CFG.RUG_GUARD_WINDOW_MS <= 0) return;
 
@@ -562,7 +650,7 @@ async function rugGuardAfterBuy({ mint, entryRatio }) {
       const probe = await gmgnGetRoute({
         tokenIn: CFG.BASE_SOL_MINT, tokenOut: mint, inLamports: probeIn,
         fromAddress: WALLET_PK, slippagePct: CFG.MAX_SLIPPAGE,
-        feeSol: CFG.PRIORITY_FEE_SOL, isAntiMev: CFG.ANTI_MEV,
+        feeSol: feeBuy(), isAntiMev: CFG.ANTI_MEV,
       });
       failStreak = 0;
 
@@ -588,7 +676,7 @@ async function rugGuardAfterBuy({ mint, entryRatio }) {
         await sellAllViaGMGN(mint); return;
       }
     }
-    await sleep(220); // plus agressif qu'avant
+    await sleep(220);
   }
 }
 
@@ -634,20 +722,22 @@ function sanitizedProgramIds(list) {
   }
   return out;
 }
-
 const LOG_RE = new RegExp(CFG.POOL_LOG_PATTERNS, 'i');
 
 class HeliusWS {
   constructor(url) {
     this.url = url;
     this.ws = null;
-    this.subs = new Map();
+    this.subs = new Map();              // key -> payload (pour resend à la reconnexion)
     this.pinger = null;
     this.reconnTimer = null;
     this.nextId = 1;
 
-    this.reqIdToSig = new Map(); // request id -> signature (avant subId)
-    this.subIdToSig = new Map(); // subId -> signature (pour notifications)
+    this.reqIdToSig = new Map();        // request id -> signature (signatureSubscribe)
+    this.subIdToSig = new Map();        // subId -> signature
+
+    this.reqIdToAcct = new Map();       // request id -> account pubkey (accountSubscribe)
+    this.subIdToAcct = new Map();       // subId -> account pubkey
   }
   start() { this._connect(); }
   stop() { try { this.ws?.close(); } catch{} clearInterval(this.pinger); clearTimeout(this.reconnTimer); }
@@ -669,7 +759,6 @@ class HeliusWS {
     });
     this.ws.on('error', (e) => errOnce('ws', 'WS error:', e.message));
   }
-
   _send(obj) {
     try { this.ws?.send(JSON.stringify(obj)); } catch (e) { errOnce('wsSend', e.message); }
   }
@@ -681,7 +770,6 @@ class HeliusWS {
     this._send(payload);
     info(`WS logs listener started (mentions): ${pubkey}`);
   }
-
   signatureSubscribe(sig, commitment = 'processed') {
     const id = this.nextId++;
     const payload = { jsonrpc: '2.0', id, method: 'signatureSubscribe', params: [sig, { commitment }] };
@@ -689,39 +777,53 @@ class HeliusWS {
     this._send(payload);
   }
 
-  // ===== NEW: subscribe/unsubscribe dynamiques sur comptes pools =====
+  // Subscribe/unsubscribe dynamiques
   subscribeAccounts(accounts) {
     for (const a of accounts) {
       try {
         if (!PK_RE.test(a)) continue;
         const key = `logs:${a}`;
-        if (this.subs.has(key)) continue;
-        const id = this.nextId++;
-        const payload = { jsonrpc: '2.0', id, method: 'logsSubscribe', params: [{ mentions: [a] }, { commitment: 'processed' }] };
-        this.subs.set(key, payload);
-        this._send(payload);
-        info(`WS pool-account listener started: ${a}`);
+        if (!this.subs.has(key)) {
+          const id = this.nextId++;
+          const payload = { jsonrpc: '2.0', id, method: 'logsSubscribe', params: [{ mentions: [a] }, { commitment: 'processed' }] };
+          this.subs.set(key, payload);
+          this._send(payload);
+          info(`WS pool-account (logs) listener: ${a}`);
+        }
       } catch (e) { dbg('subscribeAccounts err', e.message); }
     }
   }
+  accountSubscribe(pubkey) {
+    try {
+      if (!PK_RE.test(pubkey)) return;
+      const key = `acct:${pubkey}`;
+      if (this.subs.has(key)) return; // already
+      const id = this.nextId++;
+      const payload = { jsonrpc: '2.0', id, method: 'accountSubscribe', params: [pubkey, { commitment: 'processed', encoding: 'jsonParsed' }] };
+      this.subs.set(key, payload);
+      this.reqIdToAcct.set(id, pubkey);
+      this._send(payload);
+      info(`WS account listener started: ${pubkey}`);
+    } catch (e) { dbg('accountSubscribe err', e.message); }
+  }
   unsubscribeAccount(a) {
-    const key = `logs:${a}`;
-    if (this.subs.has(key)) this.subs.delete(key);
+    const keyL = `logs:${a}`;
+    if (this.subs.has(keyL)) this.subs.delete(keyL);
+    const keyA = `acct:${a}`;
+    if (this.subs.has(keyA)) this.subs.delete(keyA);
   }
 
   async _onMessage(data) {
     let msg = null;
     try { msg = JSON.parse(String(data)); } catch { return; }
 
-    // Abonnement à signature → nous renvoie un subId
+    // Réponses d'abonnements → subId
     if (msg?.id && msg?.result && typeof msg.result === 'number') {
+      const subId = msg.result;
       const sig = this.reqIdToSig.get(msg.id);
-      if (sig) {
-        const subId = msg.result;
-        this.subIdToSig.set(subId, sig);
-        this.reqIdToSig.delete(msg.id);
-        return;
-      }
+      if (sig) { this.subIdToSig.set(subId, sig); this.reqIdToSig.delete(msg.id); return; }
+      const acct = this.reqIdToAcct.get(msg.id);
+      if (acct) { this.subIdToAcct.set(subId, acct); this.reqIdToAcct.delete(msg.id); return; }
     }
 
     // logsNotification
@@ -731,27 +833,50 @@ class HeliusWS {
       const logs = res?.logs || [];
       if (!sig || !Array.isArray(logs) || logs.length === 0) return;
 
-      // 1) Déclencheur initial (création pool etc.)
+      // Déclencheur initial
       if (CFG.WS_REQUIRE_PATTERN) {
         const hit = logs.some(line => LOG_RE.test(line));
-        if (hit) {
-          info(`[WS] logs match → signatureSubscribe (sig=${sig})`);
-          this.signatureSubscribe(sig, CFG.SIGNATURE_COMMITMENT || 'processed');
-        }
+        if (hit) this.signatureSubscribe(sig, CFG.SIGNATURE_COMMITMENT || 'processed');
       } else {
         this.signatureSubscribe(sig, CFG.SIGNATURE_COMMITMENT || 'processed');
       }
 
-      // 2) ===== NEW: détection "withdraw/remove liquidity/burn" sur comptes surveillés =====
+      // withdraw-like keywords
       const joined = logs.join(' ').toLowerCase();
-      const suspiciousKw = ['withdraw', 'remove_liquidity', 'removeliquidity', 'withdrawliquidity', 'closeposition', 'decrease_liquidity', 'burn', 'burned', 'rmlq', 'withdraw_reserve'];
+      const suspiciousKw = ['withdraw', 'remove_liquidity', 'removeliquidity', 'withdrawliquidity', 'closeposition', 'decrease_liquidity', 'burn', 'burned', 'withdraw_reserve'];
       const hitKw = suspiciousKw.some(k => joined.includes(k));
-
       if (hitKw) {
         for (const [addr, mint] of poolAddrToMint.entries()) {
           if (joined.includes(addr.toLowerCase())) {
-            warn(`[WS] ⚠️ detected withdraw-like log on ${addr} (sig=${sig}) → SELL ALL for mint ${mint}`);
+            warn(`[WS] ⚠️ withdraw-like log on ${addr} → SELL ${mint}`);
             (async () => { try { await sellAllViaGMGN(mint); } catch(e) { warn('post-withdraw sell err', e.message); } })();
+          }
+        }
+      }
+      return;
+    }
+
+    // accountNotification (baisse de réserves)
+    if (msg?.method === 'accountNotification') {
+      const subId = msg?.params?.subscription;
+      const pubkey = this.subIdToAcct.get(subId);
+      const dataV = msg?.params?.result?.value?.data;
+      const parsed = dataV?.parsed;
+      const uiAmount = Number(parsed?.info?.tokenAmount?.uiAmount || 0);
+      if (!pubkey || !Number.isFinite(uiAmount)) return;
+
+      // track drop
+      if (!globalThis.__acctPrevBal) globalThis.__acctPrevBal = new Map();
+      const prev = globalThis.__acctPrevBal.get(pubkey) ?? uiAmount;
+      globalThis.__acctPrevBal.set(pubkey, uiAmount);
+
+      if (prev > 0) {
+        const dropPct = (1 - (uiAmount / prev)) * 100;
+        if (dropPct >= CFG.ACCT_DROP_PCT_TRIGGER) {
+          const mint = poolAddrToMint.get(pubkey);
+          if (mint) {
+            warn(`[WS] 🔻 reserve drop ${dropPct.toFixed(1)}% on ${pubkey} ≥ ${CFG.ACCT_DROP_PCT_TRIGGER}% → SELL ${mint}`);
+            (async () => { try { await sellAllViaGMGN(mint); } catch(e) { warn('sell on acctDrop err', e.message); } })();
           }
         }
       }
@@ -763,11 +888,8 @@ class HeliusWS {
       const subId = msg?.params?.subscription;
       const sig = this.subIdToSig.get(subId);
       const errV = msg?.params?.result?.value?.err ?? msg?.params?.result?.err ?? null;
-
-      if (!sig) { dbg('[WS] signatureNotification sans sig (subId inconnu)'); return; }
-
+      if (!sig) { dbg('[WS] signatureNotification sans sig'); return; }
       this.subIdToSig.delete(subId);
-
       if (errV) { dbg(`[WS] signature FAILED sig=${sig}`); return; }
 
       const tx = await getTransactionWithFallback(sig);
@@ -814,7 +936,7 @@ app.get('/health', (_req, res) => res.send({
     pumpTriggerMinSol: CFG.PUMP_TRIGGER_MIN_SOL,
     tradeSizeSOL: CFG.TRADE_SIZE_SOL,
     maxSlippage: CFG.MAX_SLIPPAGE,
-    priorityFeeSOL: CFG.PRIORITY_FEE_SOL,
+    priorityFees: { buy: feeBuy(), sell: feeSell() },
     antiMEV: CFG.ANTI_MEV,
     exitTimeoutMs: CFG.EXIT_TIMEOUT_MS,
     ammPrograms: CFG.AMM_PROGRAM_IDS,
@@ -823,13 +945,19 @@ app.get('/health', (_req, res) => res.send({
     patterns: CFG.POOL_LOG_PATTERNS,
     commitments: { sig: CFG.SIGNATURE_COMMITMENT, tx: CFG.TX_FETCH_COMMITMENT },
     earlyProbe: { ms: CFG.EARLY_ROUTE_PROBE_MS, interval: CFG.EARLY_ROUTE_PROBE_INTERVAL_MS, relaxMs: CFG.EARLY_RELAX_GUARDS_MS },
-    // NEW:
     antiWithdraw: {
       preMs: CFG.PRE_SUBMIT_STABILITY_MS,
       prePolls: CFG.PRE_SUBMIT_POLLS,
       preDropPct: CFG.PRE_SUBMIT_DROP_PCT,
       postListenMs: CFG.POST_SUBSCRIBE_MONITOR_MS,
       poolTokMin: CFG.POOL_TOKEN_MIN_BALANCE,
+      acctDropTrigger: CFG.ACCT_DROP_PCT_TRIGGER,
+    },
+    holders: {
+      preBuy: CFG.HOLDER_CHECK_PREBUY,
+      postMs: CFG.HOLDER_CHECK_POSTBUY_MS,
+      top1Max: CFG.TOP1_HOLDER_MAX_PCT,
+      top10Max: CFG.TOP10_HOLDER_MAX_PCT,
     },
   },
 }));
@@ -839,7 +967,7 @@ app.listen(CFG.PORT, () => {
   info(`GMGN sniping listener on :${CFG.PORT} (LOG_LEVEL=${CFG.LOG_LEVEL})`);
 
   const ws = new HeliusWS(CFG.HELIUS_WS_URL);
-  globalThis.wsInstance = ws; // <— exposé pour buyViaGMGN (subscriptions dynamiques)
+  globalThis.wsInstance = ws;
 
   const programs = sanitizedProgramIds(CFG.AMM_PROGRAM_IDS);
   if (programs.length === 0) {
