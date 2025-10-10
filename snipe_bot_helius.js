@@ -1,14 +1,13 @@
 /**
- * snipe_bot_ws_raw_gmgn.js — v7 (anti-withdraw + holders + sell-probe)
+ * snipe_bot_ws_raw_gmgn.js — v7-virtual-verbose
  *
- * - WS Helius logsSubscribe(mentions) + signatureSubscribe + accountSubscribe (réserves pool)
- * - getTransaction 'confirmed' + fallback 'finalized'
- * - Early Route Probe (little pool / out=0) → retry X ms
- * - Garde-fous GMGN (slippage/min-out/price impact)
- * - Pré-submit: "liquidity stability check" (anti-withdraw instantané)
- * - Post-buy: écoute logs + accounts (drop réserves) → SELL agressif
- * - Post-buy: sondage SELL (route dispo + ratio) toutes 200ms
- * - Holders guard: top1/top10 hors réserves (pré-buy + re-check 2s) → exit si concentré
+ * - Mode VIRTUEL (paper): aucune tx envoyée, PnL estimé, logs live MTM
+ * - WS Helius: logsSubscribe + signatureSubscribe + accountSubscribe (réserves)
+ * - Early Route Probe + garde-fous route (slippage/min-out/impact)
+ * - Pré-submit: stabilité des réserves (anti withdraw immédiat)
+ * - Post-buy: écoute logs + accounts (drop réserves) → SELL (réel ou virtuel)
+ * - Post-buy: sondage SELL (no route / ratio qui s’écroule) → SELL
+ * - Holders guard: top1/top10 hors réserves (pré-buy + re-check post-buy)
  * - Timeout de sortie + rug-guard prix
  */
 
@@ -48,8 +47,9 @@ const CFG = {
 
   // Trade
   TRADE_SIZE_SOL: Number(process.env.TRADE_SIZE_SOL || 0.20),
-  MAX_SLIPPAGE: Number(process.env.MAX_SLIPPAGE || 0.30), // 0.20 = 20%
-  // priority fees (BUY/SELL distincts possibles)
+  MAX_SLIPPAGE: Number(process.env.MAX_SLIPPAGE || 0.30),
+
+  // Priority fees (BUY/SELL distincts possibles)
   PRIORITY_FEE_SOL: Number(process.env.PRIORITY_FEE_SOL || 0.006), // fallback
   PRIORITY_FEE_BUY: (process.env.PRIORITY_FEE_BUY !== undefined ? Number(process.env.PRIORITY_FEE_BUY) : undefined),
   PRIORITY_FEE_SELL: (process.env.PRIORITY_FEE_SELL !== undefined ? Number(process.env.PRIORITY_FEE_SELL) : undefined),
@@ -90,7 +90,7 @@ const CFG = {
   AMM_PROGRAM_IDS: (process.env.AMM_PROGRAM_IDS || '')
     .split(',').map(s => s.trim()).filter(Boolean),
 
-  // Motifs de logs (CreatePool/AddLiquidity …)
+  // Motifs de logs
   WS_REQUIRE_PATTERN: ['1','true','yes'].includes(String(process.env.WS_REQUIRE_PATTERN || 'true').toLowerCase()),
   POOL_LOG_PATTERNS: (process.env.POOL_LOG_PATTERNS || [
     'create_pool','CreatePool','createPool',
@@ -113,13 +113,20 @@ const CFG = {
   POOL_TOKEN_MIN_BALANCE: Number(process.env.POOL_TOKEN_MIN_BALANCE || 10),
 
   /* ====== Account drop trigger ====== */
-  ACCT_DROP_PCT_TRIGGER: Number(process.env.ACCT_DROP_PCT_TRIGGER || 15), // % de chute d'une réserve ⇒ SELL
+  ACCT_DROP_PCT_TRIGGER: Number(process.env.ACCT_DROP_PCT_TRIGGER || 15),
 
   /* ====== Holders concentration ====== */
   TOP1_HOLDER_MAX_PCT: Number(process.env.TOP1_HOLDER_MAX_PCT || 40),
   TOP10_HOLDER_MAX_PCT: Number(process.env.TOP10_HOLDER_MAX_PCT || 85),
   HOLDER_CHECK_PREBUY: ['1','true','yes'].includes(String(process.env.HOLDER_CHECK_PREBUY || 'true').toLowerCase()),
   HOLDER_CHECK_POSTBUY_MS: Number(process.env.HOLDER_CHECK_POSTBUY_MS || 2000),
+
+  /* ====== Virtual / Paper mode ====== */
+  VIRTUAL_MODE: ['1','true','yes'].includes(String(process.env.VIRTUAL_MODE || 'false').toLowerCase()),
+  VIRTUAL_NOTE: String(process.env.VIRTUAL_NOTE || ''),
+  VIRTUAL_VERBOSE: ['1','true','yes'].includes(String(process.env.VIRTUAL_VERBOSE || 'true').toLowerCase()),
+  VIRTUAL_MTM_MS: Number(process.env.VIRTUAL_MTM_MS || 800),
+  VIRTUAL_MTM_CHANGE_PCT: Number(process.env.VIRTUAL_MTM_CHANGE_PCT || 2.5),
 };
 
 /* ====================== Logger ====================== */
@@ -137,11 +144,12 @@ function errOnce(key, ...msg) {
 }
 
 if (!CFG.WALLET_SECRET_KEY) { err('❌ WALLET_SECRET_KEY manquant'); process.exit(1); }
+if (!CFG.HEIUS_WS_URL && !CFG.HELIUS_WS_URL) {} // noop
 if (!CFG.HELIUS_WS_URL) { err('❌ HELIUS_WS_URL manquant'); process.exit(1); }
 
 if (!fs.existsSync(CFG.CSV_FILE)) fs.writeFileSync(CFG.CSV_FILE, 'time,event,side,sol,token,extra\n');
 const csv = (r) => {
-  const line = `${new Date().toISOString()},${r.event},${r.side||''},${r.sol||''},${r.token||''},${r.extra||''}\n`;
+  const line = `${new Date().toISOString()},${r.event},${r.side||''},${r.sol||''},${r.token||''},${(r.extra||'').toString().replace(/\n/g,' ')}\n`;
   fs.appendFileSync(CFG.CSV_FILE, line);
 };
 
@@ -154,9 +162,16 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fmt = (n, d=6) => (typeof n === 'number' ? Number(n).toFixed(d) : n);
 const PK_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
-/* Globals */
+/* ====================== Globals ====================== */
 const poolAddrToMint = new Map();   // pool token account addr -> mint we bought
 const mintToPoolAddrs = new Map();  // mint -> [pool token account addrs]
+
+/* ===== Virtual positions (in-memory) + trackers ===== */
+const VIRT = {
+  open: new Map(),      // mint -> { ts, inSol, expOutTokens, entryRatio, poolAddrs, note }
+  history: [],
+  trackers: new Map(),  // mint -> { timer, lastOutSol }
+};
 
 /* ====================== File HTTP ====================== */
 class HttpBucket {
@@ -344,7 +359,7 @@ function assertRouteGuards(routeData) {
   }
 }
 
-/* ====================== NEW: Anti-withdraw helpers ====================== */
+/* ====================== Anti-withdraw helpers ====================== */
 const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 
 async function isTokenAccount(pubkeyStr) {
@@ -456,10 +471,88 @@ async function getLargestHoldersMetrics(mint, { excludeAddrs = [] } = {}) {
   }
 }
 
-/* ====================== BUY / SELL ====================== */
+/* ====================== VIRTUAL helpers (open/close/track) ====================== */
 function feeBuy()  { return (CFG.PRIORITY_FEE_BUY ?? CFG.PRIORITY_FEE_SOL); }
 function feeSell() { return (CFG.PRIORITY_FEE_SELL ?? CFG.PRIORITY_FEE_SOL); }
 
+function virtOpen(mint, { inSol, expOutTokens, entryRatio, poolAddrs }) {
+  const now = Date.now();
+  VIRT.open.set(mint, { ts: now, inSol, expOutTokens, entryRatio, poolAddrs, note: CFG.VIRTUAL_NOTE });
+  VIRT.trackers.delete(mint);
+  csv({ event:'vbuy', side:'VBUY', sol:inSol, token:mint, extra:`entryRatio=${fmt(entryRatio,6)} tokens=${fmt(expOutTokens,4)}` });
+  info(`[VIRTUAL] 📥 OPEN ${mint} inSol=${fmt(inSol,4)} tokens≈${fmt(expOutTokens,4)} r=${fmt(entryRatio,6)} ${CFG.VIRTUAL_NOTE?`(${CFG.VIRTUAL_NOTE})`:''}`);
+
+  if (CFG.VIRTUAL_VERBOSE) startVirtualTracker(mint);
+}
+function virtClose(mint, { outSol, reason='virtual-exit' } = {}) {
+  const pos = VIRT.open.get(mint);
+  if (!pos) { warn(`[VIRTUAL] close skip: no open pos for ${mint}`); return null; }
+  const dt = Date.now() - pos.ts;
+  const pnlSol = Number(outSol) - Number(pos.inSol);
+
+  // stop tracker
+  const tr = VIRT.trackers.get(mint);
+  if (tr?.timer) try { clearInterval(tr.timer); } catch {}
+  VIRT.trackers.delete(mint);
+
+  VIRT.open.delete(mint);
+  const rec = { mint, openedAt: pos.ts, msHeld: dt, inSol: pos.inSol, outSol, pnlSol, reason, note: pos.note };
+  VIRT.history.unshift(rec);
+  csv({ event:'vsell', side:'VSELL', sol:outSol, token:mint, extra:`pnl=${fmt(pnlSol,6)} heldMs=${dt} reason=${reason}` });
+
+  const pnlPct = pos.inSol > 0 ? (pnlSol / pos.inSol) * 100 : 0;
+  info(`[VIRTUAL] 📤 CLOSE ${mint} outSol=${fmt(outSol,4)} pnl=${fmt(pnlSol,6)} (${pnlPct.toFixed(2)}%) in ${dt}ms ← ${reason}`);
+  return rec;
+}
+async function _virtQuoteSellSol(mint) {
+  try {
+    const pos = VIRT.open.get(mint);
+    if (!pos) return null;
+    const amountIn = pos.expOutTokens; // quantité virtuelle détenue
+    const route = await gmgnGetRoute({
+      tokenIn: mint, tokenOut: CFG.BASE_SOL_MINT, inLamports: amountIn,
+      fromAddress: WALLET_PK, slippagePct: CFG.MAX_SLIPPAGE,
+      feeSol: feeSell(), isAntiMev: CFG.ANTI_MEV,
+    });
+    const outSol = Number(route?.quote?.outAmount || 0);
+    return { outSol, route };
+  } catch (e) {
+    return { outSol: 0, err: String(e?.message || e) };
+  }
+}
+function startVirtualTracker(mint) {
+  const pos = VIRT.open.get(mint);
+  if (!pos) return;
+  const interval = Math.max(200, CFG.VIRTUAL_MTM_MS);
+  const tr = { timer: null, lastOutSol: -1 };
+  VIRT.trackers.set(mint, tr);
+
+  tr.timer = setInterval(async () => {
+    const now = Date.now();
+    const heldMs = now - pos.ts;
+    const q = await _virtQuoteSellSol(mint);
+    if (!q) return;
+    const outSol = Number(q.outSol || 0);
+
+    let shouldLog = false;
+    if (tr.lastOutSol <= 0) shouldLog = true;
+    else {
+      const changePct = (Math.abs(outSol - tr.lastOutSol) / Math.max(1e-9, tr.lastOutSol)) * 100;
+      if (changePct >= CFG.VIRTUAL_MTM_CHANGE_PCT) shouldLog = true;
+      if (heldMs % 5000 < interval) shouldLog = true; // heartbeat 5s
+    }
+
+    if (shouldLog) {
+      tr.lastOutSol = outSol;
+      const pnlSol = outSol - pos.inSol;
+      const pnlPct = pos.inSol > 0 ? (pnlSol / pos.inSol) * 100 : 0;
+      const secs = (heldMs/1000).toFixed(1);
+      info(`[VIRTUAL][MTM] ${mint} t=${secs}s val=${fmt(outSol,4)} pnl=${fmt(pnlSol,6)} (${pnlPct.toFixed(2)}%)`);
+    }
+  }, interval);
+}
+
+/* ====================== BUY / SELL ====================== */
 async function buyViaGMGN(mint, { startTs=Date.now() } = {}) {
   const inLamports = Math.floor(CFG.TRADE_SIZE_SOL * LAMPORTS_PER_SOL);
   const route = await gmgnGetRoute({
@@ -477,7 +570,7 @@ async function buyViaGMGN(mint, { startTs=Date.now() } = {}) {
   const stable = await preSubmitLiquidityStabilityCheck(rawBase64);
   if (!stable) throw new Error('pre-submit liquidity stability check failed');
 
-  // Identifie comptes du pool + subscribe (logs + accounts)
+  // Comptes du pool + subscriptions
   let poolAddrs = [];
   try {
     const poolTok = await extractPoolTokenAccountsFromRawBase64(rawBase64);
@@ -492,7 +585,7 @@ async function buyViaGMGN(mint, { startTs=Date.now() } = {}) {
     }
   } catch (e) { dbg('subscribe pool accounts err', e.message); }
 
-  // (Optionnel recommandé) Holders guard AVANT BUY
+  // Holders guard AVANT BUY
   if (CFG.HOLDER_CHECK_PREBUY) {
     const holders = await getLargestHoldersMetrics(mint, { excludeAddrs: poolAddrs });
     if (holders.ok) {
@@ -503,14 +596,60 @@ async function buyViaGMGN(mint, { startTs=Date.now() } = {}) {
     }
   }
 
-  // Sign & submit
+  const entryRatio = ratioOutOverIn(route.quote) || 0;
+
+  if (CFG.VIRTUAL_MODE) {
+    // ===== MODE VIRTUEL =====
+    const inSol = CFG.TRADE_SIZE_SOL;
+    const expOutTokens = Number(route?.quote?.outAmount || 0);
+    virtOpen(mint, { inSol, expOutTokens, entryRatio, poolAddrs });
+
+    // Probes / gardes identiques
+    postBuySellProbe(mint, entryRatio).catch(()=>{});
+    rugGuardAfterBuy({ mint, entryRatio }).catch(()=>{});
+
+    if (CFG.HOLDER_CHECK_POSTBUY_MS > 0) {
+      setTimeout(async () => {
+        try {
+          const holders = await getLargestHoldersMetrics(mint, { excludeAddrs: poolAddrs });
+          if (holders.ok) {
+            info(`[HOLDERS post] top1=${holders.top1Pct.toFixed(1)}% | top10=${holders.top10Pct.toFixed(1)}%`);
+            if (holders.top1Pct >= CFG.TOP1_HOLDER_MAX_PCT || holders.top10Pct >= CFG.TOP10_HOLDER_MAX_PCT) {
+              warn('[HOLDERS post] concentration too high → VIRTUAL SELL NOW');
+              await sellAllViaGMGN(mint, { reason: 'holders-concentration' });
+            }
+          }
+        } catch (e) { warn('holders post-check error:', e.message); }
+      }, CFG.HOLDER_CHECK_POSTBUY_MS);
+    }
+
+    if (CFG.EXIT_TIMEOUT_MS > 0) {
+      setTimeout(async () => {
+        info(`⏳ [VIRTUAL] Timeout ${CFG.EXIT_TIMEOUT_MS}ms → VSELL ${mint}`);
+        await sellAllViaGMGN(mint, { reason: 'timeout' });
+      }, CFG.EXIT_TIMEOUT_MS);
+    }
+
+    // Pas de nettoyage agressif en virtuel (on garde l’écoute pendant POST_SUBSCRIBE_MONITOR_MS)
+    setTimeout(() => {
+      try {
+        if (globalThis.wsInstance?.unsubscribeAccount) {
+          for (const a of poolAddrs) globalThis.wsInstance.unsubscribeAccount(a);
+        }
+      } catch {}
+    }, CFG.POST_SUBSCRIBE_MONITOR_MS);
+
+    return { route, hash: 'virtual' };
+  }
+
+  // ===== MODE REEL =====
   const unsigned = Buffer.from(rawBase64, 'base64');
   const tx = VersionedTransaction.deserialize(unsigned);
   tx.sign([wallet]);
   const signed = Buffer.from(tx.serialize()).toString('base64');
 
   const submit = await gmgnSubmitSignedTx(signed, CFG.ANTI_MEV);
-  info(`[BUY] …pending hash=${submit.hash} r=${fmt(ratioOutOverIn(route.quote),6)}`);
+  info(`[BUY] …pending hash=${submit.hash} r=${fmt(entryRatio,6)}`);
   csv({ event:'enter', side:'BUY', sol:CFG.TRADE_SIZE_SOL, token:mint, extra:`hash=${submit.hash}` });
 
   // Nettoyage subscriptions après fenêtre d’écoute
@@ -538,12 +677,9 @@ async function buyViaGMGN(mint, { startTs=Date.now() } = {}) {
     } catch(e) { warn('status error:', e.message); }
   })();
 
-  const entryRatio = ratioOutOverIn(route.quote) || 0;
-
-  // Probe SELL agressif pendant quelques secondes
+  // Probes / gardes en réel
   postBuySellProbe(mint, entryRatio).catch(()=>{});
-
-  // Re-check holders après X ms → SELL si concentré
+  rugGuardAfterBuy({ mint, entryRatio }).catch(()=>{});
   if (CFG.HOLDER_CHECK_POSTBUY_MS > 0) {
     setTimeout(async () => {
       try {
@@ -552,11 +688,18 @@ async function buyViaGMGN(mint, { startTs=Date.now() } = {}) {
           info(`[HOLDERS post] top1=${holders.top1Pct.toFixed(1)}% | top10=${holders.top10Pct.toFixed(1)}%`);
           if (holders.top1Pct >= CFG.TOP1_HOLDER_MAX_PCT || holders.top10Pct >= CFG.TOP10_HOLDER_MAX_PCT) {
             warn('[HOLDERS post] concentration too high → SELL NOW');
-            await sellAllViaGMGN(mint);
+            await sellAllViaGMGN(mint, { reason: 'holders-concentration' });
           }
         }
       } catch (e) { warn('holders post-check error:', e.message); }
     }, CFG.HOLDER_CHECK_POSTBUY_MS);
+  }
+
+  if (CFG.EXIT_TIMEOUT_MS > 0) {
+    setTimeout(async () => {
+      info(`⏳ Timeout ${CFG.EXIT_TIMEOUT_MS}ms → SELL ALL ${mint}`);
+      await sellAllViaGMGN(mint, { reason: 'timeout' });
+    }, CFG.EXIT_TIMEOUT_MS);
   }
 
   return { route, hash: submit.hash };
@@ -573,7 +716,30 @@ async function getTokenBalanceLamports(owner, mint) {
   }
   return Number(total);
 }
-async function sellAllViaGMGN(mint) {
+
+async function sellAllViaGMGN(mint, { virtual=false, reason='manual' } = {}) {
+  if (CFG.VIRTUAL_MODE || virtual) {
+    // ===== VENTE VIRTUELLE =====
+    const amountIn = VIRT.open.get(mint)?.expOutTokens || await getTokenBalanceLamports(WALLET_PK, mint);
+    if (amountIn <= 0) { warn('[VSELL] skip: no virtual amount'); return null; }
+
+    try {
+      const route = await gmgnGetRoute({
+        tokenIn: mint, tokenOut: CFG.BASE_SOL_MINT, inLamports: amountIn,
+        fromAddress: WALLET_PK, slippagePct: CFG.MAX_SLIPPAGE,
+        feeSol: feeSell(), isAntiMev: CFG.ANTI_MEV,
+      });
+      const outSol = Number(route?.quote?.outAmount || 0);
+      virtClose(mint, { outSol, reason });
+      return { route, hash: 'virtual' };
+    } catch (e) {
+      warn('[VSELL] route error (virtual):', e.message);
+      virtClose(mint, { outSol: 0, reason: `route-error:${e.message}` });
+      return null;
+    }
+  }
+
+  // ===== VENTE REELLE =====
   const amountIn = await getTokenBalanceLamports(WALLET_PK, mint);
   if (amountIn <= 0) { warn('[SELL] skip: no token balance'); return null; }
 
@@ -589,8 +755,8 @@ async function sellAllViaGMGN(mint) {
   const signed = Buffer.from(tx.serialize()).toString('base64');
 
   const submit = await gmgnSubmitSignedTx(signed, CFG.ANTI_MEV);
-  info(`[SELL] …pending hash=${submit.hash}`);
-  csv({ event:'exit', side:'SELL', sol:'', token:mint, extra:`hash=${submit.hash}` });
+  info(`[SELL] …pending hash=${submit.hash} ← ${reason}`);
+  csv({ event:'exit', side:'SELL', sol:'', token:mint, extra:`hash=${submit.hash} reason=${reason}` });
 
   (async () => {
     try {
@@ -613,8 +779,11 @@ async function postBuySellProbe(mint, entryRatio) {
   const t0 = Date.now(), maxMs = 8000;
   while (Date.now() - t0 < maxMs) {
     try {
-      const bal = await getTokenBalanceLamports(WALLET_PK, mint);
+      const bal = CFG.VIRTUAL_MODE
+        ? (VIRT.open.get(mint)?.expOutTokens || 0)
+        : await getTokenBalanceLamports(WALLET_PK, mint);
       if (bal <= 0) return;
+
       const route = await gmgnGetRoute({
         tokenIn: mint, tokenOut: CFG.BASE_SOL_MINT, inLamports: bal,
         fromAddress: WALLET_PK, slippagePct: CFG.MAX_SLIPPAGE,
@@ -623,13 +792,14 @@ async function postBuySellProbe(mint, entryRatio) {
       const r = ratioOutOverIn(route.quote);
       if (entryRatio > 0 && r < entryRatio * 0.85) {
         warn(`[PROBE] sell ratio collapsing (${r.toFixed(4)} < ${(entryRatio*0.85).toFixed(4)}) → SELL NOW`);
-        await sellAllViaGMGN(mint); return;
+        await sellAllViaGMGN(mint, { reason: 'probe:ratio<85%' });
+        return;
       }
     } catch (e) {
       const m = String(e.message||'').toLowerCase();
       if (m.includes('no route')) {
-        warn('[PROBE] jupiter has no route (SELL) → try immediate sell now');
-        try { await sellAllViaGMGN(mint); } catch {}
+        warn('[PROBE] jupiter has no route (SELL) → SELL NOW');
+        await sellAllViaGMGN(mint, { reason: 'probe:no-route' });
         return;
       }
     }
@@ -661,19 +831,22 @@ async function rugGuardAfterBuy({ mint, entryRatio }) {
         const dropPct = (1 - (ratio / entryRatio)) * 100;
         if (dropPct >= CFG.RUG_DROP_PCT) {
           warn(`[RUG] drop ${dropPct.toFixed(1)}% ≥ ${CFG.RUG_DROP_PCT}% → SELL NOW`);
-          await sellAllViaGMGN(mint); return;
+          await sellAllViaGMGN(mint, { reason: 'rug-guard:price-drop' });
+          return;
         }
       }
       if (imp > Math.max(45, CFG.MAX_PRICE_IMPACT_PCT + 20)) {
         warn(`[RUG] impact ${imp.toFixed(1)}% → SELL NOW`);
-        await sellAllViaGMGN(mint); return;
+        await sellAllViaGMGN(mint, { reason: 'rug-guard:impact' });
+        return;
       }
     } catch (e) {
       failStreak++;
       warn('[RUG] probe error:', e.message);
       if (failStreak >= 3) {
         warn('[RUG] probes repeatedly failing → SELL NOW');
-        await sellAllViaGMGN(mint); return;
+        await sellAllViaGMGN(mint, { reason: 'rug-guard:probe-fail' });
+        return;
       }
     }
     await sleep(220);
@@ -706,8 +879,7 @@ async function handleFromTx(sig, tx) {
   try {
     const { route } = await buyViaGMGN(mint, { startTs });
     const entryRatio = ratioOutOverIn(route.quote) || 0;
-    rugGuardAfterBuy({ mint, entryRatio }).catch(()=>{});
-    if (CFG.EXIT_TIMEOUT_MS > 0) setTimeout(async () => { info(`⏳ Timeout ${CFG.EXIT_TIMEOUT_MS}ms → SELL ALL ${mint}`); await sellAllViaGMGN(mint); }, CFG.EXIT_TIMEOUT_MS);
+    // rugGuardAfterBuy déjà appelé dans buyViaGMGN
   } catch (e) { err('Buy failed:', e.message); }
 }
 
@@ -728,7 +900,7 @@ class HeliusWS {
   constructor(url) {
     this.url = url;
     this.ws = null;
-    this.subs = new Map();              // key -> payload (pour resend à la reconnexion)
+    this.subs = new Map();              // key -> payload
     this.pinger = null;
     this.reconnTimer = null;
     this.nextId = 1;
@@ -849,7 +1021,7 @@ class HeliusWS {
         for (const [addr, mint] of poolAddrToMint.entries()) {
           if (joined.includes(addr.toLowerCase())) {
             warn(`[WS] ⚠️ withdraw-like log on ${addr} → SELL ${mint}`);
-            (async () => { try { await sellAllViaGMGN(mint); } catch(e) { warn('post-withdraw sell err', e.message); } })();
+            (async () => { try { await sellAllViaGMGN(mint, { reason: 'withdraw-log' }); } catch(e) { warn('post-withdraw sell err', e.message); } })();
           }
         }
       }
@@ -865,7 +1037,6 @@ class HeliusWS {
       const uiAmount = Number(parsed?.info?.tokenAmount?.uiAmount || 0);
       if (!pubkey || !Number.isFinite(uiAmount)) return;
 
-      // track drop
       if (!globalThis.__acctPrevBal) globalThis.__acctPrevBal = new Map();
       const prev = globalThis.__acctPrevBal.get(pubkey) ?? uiAmount;
       globalThis.__acctPrevBal.set(pubkey, uiAmount);
@@ -876,7 +1047,7 @@ class HeliusWS {
           const mint = poolAddrToMint.get(pubkey);
           if (mint) {
             warn(`[WS] 🔻 reserve drop ${dropPct.toFixed(1)}% on ${pubkey} ≥ ${CFG.ACCT_DROP_PCT_TRIGGER}% → SELL ${mint}`);
-            (async () => { try { await sellAllViaGMGN(mint); } catch(e) { warn('sell on acctDrop err', e.message); } })();
+            (async () => { try { await sellAllViaGMGN(mint, { reason: `reserve-drop-${dropPct.toFixed(1)}%` }); } catch(e) { warn('sell on acctDrop err', e.message); } })();
           }
         }
       }
@@ -900,7 +1071,7 @@ class HeliusWS {
   }
 }
 
-/* ====================== Webhook (raw + enhanced) ====================== */
+/* ====================== Webhook + Health + Virtual endpoints ====================== */
 const app = express();
 app.use(bodyParser.json({ limit: '20mb' }));
 
@@ -959,8 +1130,23 @@ app.get('/health', (_req, res) => res.send({
       top1Max: CFG.TOP1_HOLDER_MAX_PCT,
       top10Max: CFG.TOP10_HOLDER_MAX_PCT,
     },
+    virtual: {
+      enabled: CFG.VIRTUAL_MODE,
+      verbose: CFG.VIRTUAL_VERBOSE,
+      mtmMs: CFG.VIRTUAL_MTM_MS,
+      mtmChangePct: CFG.VIRTUAL_MTM_CHANGE_PCT,
+      note: CFG.VIRTUAL_NOTE,
+    },
   },
 }));
+
+app.get('/virtual-positions', (_req, res) => {
+  res.send({
+    virtual: CFG.VIRTUAL_MODE,
+    open: [...VIRT.open.entries()].map(([mint, v]) => ({ mint, ...v })),
+    history: VIRT.history.slice(0, 50),
+  });
+});
 
 /* ====================== Start ====================== */
 app.listen(CFG.PORT, () => {
